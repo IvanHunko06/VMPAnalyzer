@@ -1,0 +1,48 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(VMPAnalyzer LANGUAGES CXX)
+
+# 1. Настройки компилятора
+if(MSVC)
+    add_compile_options(/MP /W3)
+endif()
+
+include(CPM.cmake)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+add_compile_options(/std:c++20)
+
+find_package(Boost REQUIRED)
+
+
+# 6. Собираем наш EXE
+file(GLOB_RECURSE SRC_FILES 
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
+)
+
+find_package(Triton CONFIG REQUIRED)
+find_package(Boost 1.55.0 REQUIRED)
+
+add_executable(VMPAnalyzer ${SRC_FILES})
+
+if (MSVC)
+target_compile_options(VMPAnalyzer PRIVATE
+  $<$<CONFIG:RelWithDebInfo>:/Od>
+)
+else()
+target_compile_options(VMPAnalyzer PRIVATE
+  $<$<CONFIG:RelWithDebInfo>:-O0>
+)
+endif()
+
+target_link_libraries(VMPAnalyzer PRIVATE triton::triton)
+target_include_directories(VMPAnalyzer PUBLIC "${Boost_INCLUDE_DIRS}")
+
+add_custom_command(TARGET VMPAnalyzer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "$<TARGET_FILE:triton::triton>"
+    "$<TARGET_FILE_DIR:VMPAnalyzer>"
+)
+
