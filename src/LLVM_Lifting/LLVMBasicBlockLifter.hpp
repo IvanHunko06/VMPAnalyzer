@@ -19,7 +19,6 @@ class LLVMBasicBlockLifter {
 	llvm::Type* nativeContextType;
 	llvm::Value* imageBaseDif;
 	llvm::Value* targetVip;
-	llvm::Value* virtualContext;
 private:
 	llvm::Type* i64;
 	llvm::Type* i32;
@@ -41,28 +40,41 @@ private:
 	struct ShadowStackSlot {
 		llvm::Value* value{ nullptr };
 		uint64_t bitDepth{ BitDepth_64 };
-		bool isVspPush{ false };
+		bool isInStackAddress{ false }; // Является ли это значение адресом в стеке (для оптимизаций доступа к стеку)
+		ShadowStackSlot* isPointerToVirtualStackSlot{ nullptr }; // Если это значение является указателем на виртуальный стек, сохраняем указание на соответствующий слот
 		std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
 	};
-	struct ShadowStackPop{
+	struct ShadowStackPop {
 		llvm::Value* value{ nullptr };
-		bool isVspPush{ false };
-		std::optional<FlagsPromise> flagsPromise;
+		bool isInStackAddress{ false }; // Является ли это значение адресом в стеке (для оптимизаций доступа к стеку)
+		ShadowStackSlot* isPointerToVirtualStackSlot{ nullptr }; // Если это значение является указателем на виртуальный стек, сохраняем указание на соответствующий слот
+		std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
 	};
-	std::map<uint64_t, FlagsPromise> flagCalculators;
 	std::deque<ShadowStackSlot> shadowStack;
+private:
+	struct ShadowContextPartialWrite {
+		int32_t offset{ 0 };
+		int32_t width{ 0 };
+		llvm::Value* value{ nullptr };
+	};
+	struct ShadowContextSlot {
+		llvm::Value* baseValue{ nullptr };
+		ShadowStackSlot* isVspPointer{ nullptr }; // Является ли это значение указателем на стек (для оптимизаций доступа к стеку)
+		bool isInStackPointer{ false }; // Является ли это значение указателем, который может указывать в стек (для оптимизаций доступа к стеку)
+		std::vector<ShadowContextPartialWrite> partialWrites;
+	};
+	std::map<int32_t, ShadowContextSlot> shadowContext; // Ключ - смещение в структуре NativeContext
+	std::map<int32_t, FlagsPromise> registerFlagsPromises; // Если регистр, который обещает флаги, был перезаписан, сохраняем информацию о том, какие флаги он обещал, чтобы можно было попытаться восстановить эти флаги при необходимости
 
 public:
 	LLVMBasicBlockLifter(llvm::LLVMContext* context, llvm::Module* llvmModule, llvm::IRBuilder<>* builder, llvm::Function* function,
 		llvm::Value* vsp_ptr, llvm::Value* vspBasePtr, llvm::Value* nativeContext, llvm::Type* nativeContextType, llvm::Value* imageBaseDif,
-		llvm::Value* targetVip, llvm::Value* virtualContext);
+		llvm::Value* targetVip);
 	
 	llvm::BasicBlock* LiftBasicBlock(const VirtualBasicBlock& vbb, bool useMemoryHooks = true, bool logMessages = false);
 	void FlushVsp(bool clearStack);
-	void SetStackOffset(int64_t offset) {
-		stackOffset = offset;
-	}
 private:
+#pragma region JIT Functions
 	llvm::FunctionCallee jitReadFunc;
 	llvm::FunctionCallee jitWriteFunc;
 
@@ -87,7 +99,9 @@ private:
 	llvm::FunctionCallee jitLogShrd;
 
 	llvm::FunctionCallee jitLogJmpIndirect;
+#pragma endregion
 private:
+
 	llvm::Type* GetTypeByDepth(HandlerBitDepth depth) {
 		switch (depth) {
 		case BitDepth_8: return i8;
@@ -107,16 +121,14 @@ private:
 		default: return builder->getIntN(depth, value);
 		}
 	}
-	void Push(llvm::Value* value, HandlerBitDepth bitDepth) {
-		ShadowPush(value, bitDepth);
-	}
+
+#pragma region Shadow Stack Operations
 	void PushWithConstOffset(llvm::Value* value, HandlerBitDepth bitDepth);
 	void ShadowPush(llvm::Value* value, HandlerBitDepth bitDepth);
-	llvm::Value* Pop(HandlerBitDepth bitDepth) {
-		return ShadowPop(bitDepth).value;
-	}
 	ShadowStackPop ShadowPop(HandlerBitDepth bitDepth);
 	llvm::Value* PopWithConstOffset(HandlerBitDepth bitDepth);
+#pragma endregion
+
 	llvm::Value* GetCurrentVspVal();
 	llvm::Value* CalculateFlagsFromPromise(FlagsPromise& promise);
 	
@@ -142,18 +154,23 @@ private:
 		bool useHooks);
 
 	void LiftVmEntry(const VmEntryHandlerData& data);
+
+#pragma region Stack Operations
 	void LiftVmPop(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmPushReg(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmPushConst(bool logDebugMessage, const HandlerMatch& match);
-
 	void LiftVmPushVsp(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmPopVsp(bool logDebugMessage, const HandlerMatch& match);
-
+#pragma endregion
+	
+#pragma region Memory Accesses
 	void LiftVmReadMem(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmReadMemHooked(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmWriteMem(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmWriteMemHooked(bool logDebugMessage, const HandlerMatch& match);
+#pragma endregion
 
+#pragma region ALU Operations
 	void LiftVmAdd(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmNor(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmNand(bool logDebugMessage, const HandlerMatch& match);
@@ -163,6 +180,7 @@ private:
 
 	void LiftVmShld(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmShrd(bool logDebugMessage, const HandlerMatch& match);
+#pragma endregion
 
 	void LiftVmJmpIndirect(bool logDebugMessage, const VmJmpData& jmpData);
 	void LiftVmExit(bool logDebugMessage, const VmExitData& data);

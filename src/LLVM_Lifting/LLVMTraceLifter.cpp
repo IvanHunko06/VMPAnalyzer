@@ -74,19 +74,13 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 		"vsp_base_middle"
 	);
 
-	// Инициализируем vsp_ptr концом массива (стек растет вниз)
-	//Value* vspEnd = llvmIrBuilder->CreateInBoundsGEP(vmStackType, vsp, { llvmIrBuilder->getInt32(0), llvmIrBuilder->getInt32(4096) });
-	//Value* vspEndCast = llvmIrBuilder->CreateBitCast(vspEnd, ptrTy);
-	//llvmIrBuilder->CreateStore(vspEndCast, vsp_ptr);
-
 	targetVip = llvmIrBuilder->CreateAlloca(i64, nullptr, "target_vip");
-	auto* vmContextType = ArrayType::get(i8, 256);
-	auto* virtualContext = llvmIrBuilder->CreateAlloca(vmContextType, nullptr, "virtual_ctx");
-
 	if (!basicBlocks.empty()) {
-		llvmIrBuilder->CreateStore(llvmIrBuilder->getInt64(basicBlocks[0].startAddr), targetVip);
+		llvmIrBuilder->CreateStore(
+			llvmIrBuilder->getInt64(basicBlocks[0].startAddr), 
+			targetVip
+		);
 	}
-	//llvmIrBuilder->CreateBr(dispatchBlock);
 
 	// --- Dispatcher Block ---
 	llvmIrBuilder->SetInsertPoint(dispatchBlock);
@@ -106,19 +100,18 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 		nativeContextPtr,
 		nativeContextType,
 		imageBaseDif,
-		targetVip,
-		virtualContext // virtualContext
+		targetVip
 	);
 
 	std::map<uint64_t, VirtualBasicBlock*> vipToBlockMap;
-	std::vector<uint64_t> vipsOrder; // Для отладки и проверки порядка блоков
+	std::vector<uint64_t> vipsOrder;
 
 	for (int i = 0; i < basicBlocks.size(); i++) {
 		uint64_t blockVip = basicBlocks[i].startAddr;
 		if (i > 0) {
-			blockVip -= basicBlocks[i - 1].nextVipShift; // Сдвигаем VIP относительно начала второго блока
+			blockVip -= basicBlocks[i - 1].nextVipShift;
 		}
-		virtualBasicBlockMap[blockVip] = nullptr; // Инициализируем мапу
+		virtualBasicBlockMap[blockVip] = nullptr;
 		vipToBlockMap[blockVip] = const_cast<VirtualBasicBlock*>(&basicBlocks[i]);
 		vipsOrder.push_back(blockVip);
 	}
@@ -146,7 +139,7 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 			llvmIrBuilder->CreateBr(dispatchBlock);
 		}
 
-		//PrintBasicBlock(bb);
+		PrintBasicBlock(bb);
 	}
 
 	if (protectedCodeEntryBlock) {
