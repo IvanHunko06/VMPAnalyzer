@@ -37,20 +37,28 @@ private:
 			ADD, NOR, NAND, SHL, SHR, SHLD, SHRD
 		} operation;
 	};
+
 	struct ShadowStackSlot {
 		llvm::Value* value{ nullptr };
-		uint64_t bitDepth{ BitDepth_64 };
+		int64_t bitDepth{ BitDepth_64 };
 		bool isInStackAddress{ false }; // Является ли это значение адресом в стеке (для оптимизаций доступа к стеку)
+		bool isPadding{ false };
+		int32_t slotAbsoluteBase{ 0 };
+		int32_t relativeOffset{ 0 };
 		ShadowStackSlot* isPointerToVirtualStackSlot{ nullptr }; // Если это значение является указателем на виртуальный стек, сохраняем указание на соответствующий слот
 		std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
 	};
 	struct ShadowStackPop {
 		llvm::Value* value{ nullptr };
 		bool isInStackAddress{ false }; // Является ли это значение адресом в стеке (для оптимизаций доступа к стеку)
+		int32_t slotAbsoluteBase{ 0 };
+		int32_t relativeOffset{ 0 };
 		ShadowStackSlot* isPointerToVirtualStackSlot{ nullptr }; // Если это значение является указателем на виртуальный стек, сохраняем указание на соответствующий слот
 		std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
 	};
 	std::deque<ShadowStackSlot> shadowStack;
+	static constexpr uint64_t fakeStackBase = 0x140000;
+
 private:
 	struct ShadowContextPartialWrite {
 		int32_t offset{ 0 };
@@ -61,6 +69,8 @@ private:
 		llvm::Value* baseValue{ nullptr };
 		ShadowStackSlot* isVspPointer{ nullptr }; // Является ли это значение указателем на стек (для оптимизаций доступа к стеку)
 		bool isInStackPointer{ false }; // Является ли это значение указателем, который может указывать в стек (для оптимизаций доступа к стеку)
+		int32_t slotAbsoluteBase{ 0 };
+		int32_t relativeOffset{ 0 };
 		std::vector<ShadowContextPartialWrite> partialWrites;
 	};
 	std::map<int32_t, ShadowContextSlot> shadowContext; // Ключ - смещение в структуре NativeContext
@@ -112,7 +122,7 @@ private:
 			return builder->getIntNTy(depth);
 		}
 	}
-	llvm::Value* CreateValueByDepth(HandlerBitDepth depth, size_t value) {
+	llvm::Value* CreateValueByDepth(HandlerBitDepth depth, int64_t value) {
 		switch (depth) {
 		case BitDepth_8: return builder->getInt8(value);
 		case BitDepth_16: return builder->getInt16(value);
@@ -127,6 +137,13 @@ private:
 	void ShadowPush(llvm::Value* value, HandlerBitDepth bitDepth);
 	ShadowStackPop ShadowPop(HandlerBitDepth bitDepth);
 	llvm::Value* PopWithConstOffset(HandlerBitDepth bitDepth);
+	uint64_t GetFullShadowStackSize() {
+		uint64_t fullSize = 0;
+		for (auto& slot : shadowStack) {
+			fullSize += (slot.bitDepth / 8);
+		}
+		return fullSize;
+	}
 #pragma endregion
 
 	llvm::Value* GetCurrentVspVal();
@@ -135,6 +152,13 @@ private:
 	void InitJitHooks();
 	void InitLogFunctions();
 	llvm::Value* PackFlags(llvm::Value* res, llvm::Value* cf, llvm::Value* of, llvm::Value* sf = nullptr, llvm::Value* zf = nullptr);
+	
+	std::pair<int, int64_t> FindSlotByOffset(ShadowStackSlot* startSlot, int64_t offset);
+	bool TryGenerateShadowStackAccess(
+		ShadowStackPop* targetAddr,
+		HandlerBitDepth dataType,
+		llvm::Value* valueToWrite
+		);
 	void GenerateMemoryAccess(
 		llvm::Value* targetAddr,
 		llvm::Type* dataType,

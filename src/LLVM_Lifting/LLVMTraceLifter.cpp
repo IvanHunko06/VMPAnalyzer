@@ -62,14 +62,13 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 	llvmIrBuilder->SetInsertPoint(entryBasicBlock);
 
 	// Аллокации переменных
-	llvm::Type* vmStackType = llvm::ArrayType::get(i8, 4096);
-	auto* vsp = llvmIrBuilder->CreateAlloca(vmStackType, nullptr, "vsp_array");
+	//llvm::Type* vmStackType = llvm::ArrayType::get(i8, 4096);
+	auto* vsp = llvmIrBuilder->CreateAlloca(i8, llvmIrBuilder->getInt32(4096), "vsp_array");
 	llvmIrBuilder->CreateMemSet(vsp, llvmIrBuilder->getInt8(0), 4096, llvm::MaybeAlign(1));
 
-	auto* vsp_ptr = llvmIrBuilder->CreateConstInBoundsGEP2_32(
-		vmStackType,
+	auto* vsp_ptr = llvmIrBuilder->CreateConstInBoundsGEP1_32(
+		i8,
 		vsp,
-		0,
 		2048, // <--- ВОТ ОНО, МАГИЧЕСКОЕ ЧИСЛО
 		"vsp_base_middle"
 	);
@@ -128,6 +127,7 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 			protectedCodeEntryBlock = bb;
 		}
 
+
 		dispatchSwitch->addCase(llvmIrBuilder->getInt64(vip), bb);
 
 		// 3. В конце блока (если там еще нет терминатора) прыгаем обратно в диспетчер
@@ -139,7 +139,7 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 			llvmIrBuilder->CreateBr(dispatchBlock);
 		}
 
-		PrintBasicBlock(bb);
+		//PrintBasicBlock(bb);
 	}
 
 	if (protectedCodeEntryBlock) {

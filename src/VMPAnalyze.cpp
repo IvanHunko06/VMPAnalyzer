@@ -219,12 +219,14 @@ int main() {
 
 	auto virtualBlocks = SplitToVirtualBlocks(vmHandlers);
 	LLVMTraceLifter lifter(virtualBlocks);
+	//lifter.OptimizeModule(true);
 	//lifter.PrintModule();
-	lifter.OptimizeModule(false);
-	lifter.PrintModule();
 	CFGRepatcher::Patch(lifter);
 	lifter.OptimizeModule(true);
 	lifter.PrintModule();
+	
+	//lifter.OptimizeModule(true);
+	//lifter.PrintModule();
 	lifter.DumpModuleToFile("vm_lifted_module.ll");
 	//EmulateVmCode(vmHandlers);
 }
