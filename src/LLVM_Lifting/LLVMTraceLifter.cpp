@@ -41,12 +41,15 @@ void LLVMTraceLifter::CreateNativeContextType() {
 void LLVMTraceLifter::CreateFunction(const char* functionName) {
 	using namespace llvm;
 
-	auto* funcType = FunctionType::get(voidTy, {nativeContextType->getPointerTo(), i64}, false);
+	auto* funcType = FunctionType::get(voidTy, {nativeContextType->getPointerTo(), i8->getPointerTo(), i64}, false);
 	function = Function::Create(funcType, llvm::Function::ExternalLinkage, functionName, *llvmModule);
 
 	auto argsIt = function->arg_begin();
 	nativeContextPtr = argsIt++;
 	nativeContextPtr->setName("native_context_ptr");
+
+	realStackPtr = argsIt++;
+	realStackPtr->setName("real_stack_ptr");
 
 	imageBaseDif = argsIt++;
 	imageBaseDif->setName("image_base_dif");
@@ -139,7 +142,7 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 			llvmIrBuilder->CreateBr(dispatchBlock);
 		}
 
-		//PrintBasicBlock(bb);
+		PrintBasicBlock(bb);
 	}
 
 	if (protectedCodeEntryBlock) {

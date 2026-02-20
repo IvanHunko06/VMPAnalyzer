@@ -35,6 +35,7 @@ private:
 	llvm::StructType* nativeContextType;
 	llvm::Value* nativeContextPtr;
 	llvm::Value* imageBaseDif;
+	llvm::Value* realStackPtr;
 	llvm::AllocaInst* targetVip;
 	llvm::SwitchInst* dispatchSwitch;
 	llvm::BasicBlock* protectedCodeEntryBlock;
