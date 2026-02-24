@@ -433,12 +433,15 @@ std::optional<HandlerMatch> TryMatchVmPopVsp(const HandlerEmulationData& data) {
 
 	if (!IsVariable(*data.vspAst, "StackArg_0")) return std::nullopt;
 
+	bool hasWrites = true;
 	if (data.systemReads.size() < 256 ||
 		data.systemWrites.size() < 256) {
-		return std::nullopt;
+		hasWrites = false;
 	}
 
-
+	int64_t vspDelta = data.vspChange.endValue - data.vspChange.startValue;
+	if (hasWrites && vspDelta > 0) return std::nullopt;
+	if (!hasWrites && vspDelta < 0) return std::nullopt;
 
 	HandlerMatch match;
 	match.type = Handler_VmPopVsp;

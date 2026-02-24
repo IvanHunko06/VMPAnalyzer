@@ -75,7 +75,8 @@ private:
 private:
 	std::map<int32_t, StackAddressMeta> addressInRegMetas;
 	std::map<int32_t, FlagsPromise> calculateFlagsPromises; // Если регистр, который обещает флаги, был перезаписан, сохраняем информацию о том, какие флаги он обещал, чтобы можно было попытаться восстановить эти флаги при необходимости
-	
+	std::map<int32_t, StackAddressMeta> addressMetasStorage;
+
 	int64_t virtualStackOffset = 0;
 	int64_t realStackOffset{ 0 };
 	int64_t virtualToRealStackDif{ 0 };
@@ -143,7 +144,13 @@ private:
 	
 	llvm::Value* PopWithConstOffset(HandlerBitDepth bitDepth);
 	ShadowStackType::PopType Pop(HandlerBitDepth bitDepth) {
-		return shadowStack.Pop(bitDepth);
+		auto result = shadowStack.Pop(bitDepth);
+		auto addrMeta = addressMetasStorage.find(virtualStackOffset - bitDepth);
+		if (addrMeta != addressMetasStorage.end()) {
+			result.metadata.addressMeta = addrMeta->second;
+			addressMetasStorage.erase(addrMeta);
+		}
+		return result;
 	}
 #pragma endregion
 

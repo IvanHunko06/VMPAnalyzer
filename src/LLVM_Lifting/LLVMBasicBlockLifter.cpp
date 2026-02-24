@@ -1,7 +1,7 @@
 #include "LLVMBasicBlockLifter.hpp"
 #include "NativeContext.hpp"
 
-LLVMBasicBlockLifter::LLVMBasicBlockLifter(const BasicBlockLifterConstructor& ctor) : 
+LLVMBasicBlockLifter::LLVMBasicBlockLifter(const BasicBlockLifterConstructor& ctor) :
 	shadowStack(ctor.builder, std::bind(&LLVMBasicBlockLifter::PopWithConstOffset, this, std::placeholders::_1))
 {
 	using namespace llvm;
@@ -174,7 +174,7 @@ llvm::BasicBlock* LLVMBasicBlockLifter::LiftBasicBlock(const VirtualBasicBlock& 
 		//		!lastSlot.isInStackAddress)
 		//		__debugbreak();
 		//}
-		
+
 	}
 
 	return basicBlock;
@@ -193,7 +193,7 @@ void LLVMBasicBlockLifter::PushWithConstOffset(llvm::Value* value, HandlerBitDep
 	);
 
 	llvm::Value* typedPtr = builder->CreateBitCast(
-		ptr, 
+		ptr,
 		GetTypeByDepth(bitDepth)->getPointerTo()
 	);
 	builder->CreateStore(value, typedPtr);
@@ -247,30 +247,16 @@ void LLVMBasicBlockLifter::FlushVsp(bool clearStack, bool writeToRealStack) {
 
 		auto& addressMeta = metadata.addressMeta;
 		if (addressMeta.isInStackAddress) {
-			auto* realStackAddrI8 = builder->CreateBitCast(
-				realStackPtr, 
-				i8->getPointerTo(), 
-				"real_stack_i8"
-			);
-			auto* realStackAddrGep = builder->CreateConstInBoundsGEP1_64(
-				i8,
-				realStackAddrI8,
-				addressMeta.slotAbsoluteBase + addressMeta.relativeOffset,
-				"real_stack_typed_gep"
-			);
-			slot.value = builder->CreatePtrToInt(
-				realStackAddrGep,
-				GetTypeByDepth((HandlerBitDepth)slot.bitDepth)
-			);
+			addressMetasStorage[virtualStackOffset - slot.bitDepth] = addressMeta;
 		}
 
 		PushWithConstOffset(
-			slot.value, 
-			static_cast<HandlerBitDepth>(slot.bitDepth), 
+			slot.value,
+			static_cast<HandlerBitDepth>(slot.bitDepth),
 			writeToRealStack
 		);
 	}
-	
+
 	if (clearStack) shadowStack.Clear();
 }
 
@@ -372,7 +358,7 @@ void LLVMBasicBlockLifter::LiftVmPushReg(bool logDebugMessage, const HandlerMatc
 	bool isFlagPromise = calculateFlagsPromises.contains(baseOffset);
 	if (match.bitDepth == BitDepth_64 && isFlagPromise) {
 		auto& promise = calculateFlagsPromises[baseOffset];
-		
+
 		if (promise.res == nullptr) {
 			promise.res = CalculateFlagsFromPromise(promise);
 			builder->CreateStore(promise.res, typedSlotPtr);
@@ -396,7 +382,7 @@ void LLVMBasicBlockLifter::LiftVmPushReg(bool logDebugMessage, const HandlerMatc
 	}
 
 	shadowStack.Push(pushDepth, valueToPush, meta);
-	
+
 	// --- LOGGING ---
 	if (logDebugMessage) {
 		llvm::Value* val64 = valueToPush;
@@ -448,11 +434,11 @@ llvm::Value* LLVMBasicBlockLifter::CalculateFlagsFromPromise(FlagsPromise& promi
 		// Для простоты пока вернем false или честный расчет, если критично
 		Value* pf = builder->getFalse();
 		return std::make_tuple(sf, zf, pf);
-	};
-	
-	if (promise.operation == FlagsPromise::ADD) {	
+		};
+
+	if (promise.operation == FlagsPromise::ADD) {
 		// Исправлено: берем тип операнда, а не opType (enum)
-		auto saddFunc = Intrinsic::getDeclaration(llvmModule, Intrinsic::sadd_with_overflow, { promise.opType});
+		auto saddFunc = Intrinsic::getDeclaration(llvmModule, Intrinsic::sadd_with_overflow, { promise.opType });
 		auto sRes = builder->CreateCall(saddFunc, { promise.op1, promise.op2 });
 
 		Value* sum = builder->CreateExtractValue(sRes, 0, "add_res");
@@ -601,7 +587,7 @@ llvm::Value* LLVMBasicBlockLifter::CalculateFlagsFromPromise(FlagsPromise& promi
 }
 
 void LLVMBasicBlockLifter::LiftVmPushVsp(bool logDebugMessage, const HandlerMatch& match) {
-	
+
 	auto shadowStackSize = shadowStack.GetFullShadowStackSize();
 	auto finalOffset = virtualStackOffset - shadowStackSize;
 
@@ -639,30 +625,15 @@ void LLVMBasicBlockLifter::LiftVmPushVsp(bool logDebugMessage, const HandlerMatc
 }
 void LLVMBasicBlockLifter::LiftVmPopVsp(bool logDebugMessage, const HandlerMatch& match) {
 	auto vspPopData = std::get<VmPopVspData>(match.matchData);
-	
+
 	int64_t offset = vspPopData.offset;
 
 	auto targetAddr = Pop(match.bitDepth).value;
-	auto constTargetAddr = GetConstantInt(targetAddr);
-	if (constTargetAddr) {
-		uint64_t currentAddr = fakeStackBase - virtualStackOffset - shadowStack.GetFullShadowStackSize();
-		offset = *constTargetAddr - currentAddr;
-	}
-
-	if (vspPopData.offset > 0) {
-		__debugbreak(); //TODO: обрезание теневого стека
-	}
-
-	//FlushVsp(true);
-
-	// --- LOGGING ---
-
-	builder->CreateCall(jitLogPopVsp, {
-		builder->getInt32(match.bitDepth),
-		builder->getInt64(offset) // Логируем смещение, на которое был изменен VSP
-	});
-	// ----------------
-
+	//auto constTargetAddr = GetConstantInt(targetAddr);
+	//if (constTargetAddr) {
+	//	uint64_t currentAddr = fakeStackBase - virtualStackOffset - shadowStack.GetFullShadowStackSize();
+	//	offset = *constTargetAddr - currentAddr;
+	//}
 
 	StackMetadata meta;
 	meta.isPadding = true;
@@ -673,6 +644,21 @@ void LLVMBasicBlockLifter::LiftVmPopVsp(bool logDebugMessage, const HandlerMatch
 		(HandlerBitDepth)offset,
 		nullptr,
 		meta);
+
+	if (vspPopData.offset > 0) {
+		FlushVsp(true, false);
+	}
+
+	//FlushVsp(true);
+
+	// --- LOGGING ---
+
+	builder->CreateCall(jitLogPopVsp, {
+		builder->getInt32(match.bitDepth),
+		builder->getInt64(offset) // Логируем смещение, на которое был изменен VSP
+		});
+	// ----------------
+
 }
 
 void LLVMBasicBlockLifter::LiftVmReadMem(bool logDebugMessage, const HandlerMatch& match) {
@@ -788,11 +774,11 @@ void LLVMBasicBlockLifter::LiftVmWriteMemHooked(bool logDebugMessage, const Hand
 	}
 
 	GenerateMemoryAccess(
-		targetAddr, 
+		targetAddr,
 		realStackAddr,
-		type, 
-		val, 
-		true, 
+		type,
+		val,
+		true,
 		addrMeta.isInStackAddress
 	);
 }
@@ -852,7 +838,7 @@ void LLVMBasicBlockLifter::LiftVmAdd(bool logDebugMessage, const HandlerMatch& m
 
 	}
 
-	if (hasSignleVspOperand && fakeStackBase + relativeOffset + slotAbsoluteBase > fakeStackBase){
+	if (hasSignleVspOperand && fakeStackBase + relativeOffset + slotAbsoluteBase > fakeStackBase) {
 		hasSignleVspOperand = false;
 		relativeOffset = 0;
 		slotAbsoluteBase = 0;
@@ -918,7 +904,7 @@ void LLVMBasicBlockLifter::LiftVmNor(bool logDebugMessage, const HandlerMatch& m
 
 
 	Push(result, pushDepth);
-	
+
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = valA;
 	flagsPromise.op2 = valB;
@@ -1005,7 +991,7 @@ void LLVMBasicBlockLifter::LiftVmShl(bool logDebugMessage, const HandlerMatch& m
 	auto pushDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
 
 	Push(result, pushDepth);
-	
+
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = val;
 	flagsPromise.op2 = amt;
@@ -1096,7 +1082,7 @@ void LLVMBasicBlockLifter::LiftVmShld(bool logDebugMessage, const HandlerMatch& 
 
 
 	Push(result, pushDepth);
-	
+
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = dst;
 	flagsPromise.op2 = src;
@@ -1151,7 +1137,7 @@ void LLVMBasicBlockLifter::LiftVmShrd(bool logDebugMessage, const HandlerMatch& 
 
 
 	Push(result, pushDepth);
-	
+
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = dst;
 	flagsPromise.op2 = src;
@@ -1203,7 +1189,7 @@ void LLVMBasicBlockLifter::GenerateRamMemoryAccess(
 	bool useHooks) {
 
 	using namespace llvm;
-	Value* addrInt = targetAddr; 
+	Value* addrInt = targetAddr;
 	if (addrInt->getType()->isPointerTy()) {
 		__debugbreak(); // Ожидаем адрес в виде i64, а не указателя
 		assert(false && "Expected integer type for RAM address");
@@ -1253,15 +1239,15 @@ void LLVMBasicBlockLifter::GenerateMemoryAccess(
 	bool useHooks,
 	bool isProvenStackAddress)
 {
-	
+
 	using namespace llvm;
 
 	if (isProvenStackAddress) {
-		FlushVsp(true, true);
+		FlushVsp(true, false);
 		GenerateStackMemoryAccess(
-			targetAddr, 
-			realStackAddr, 
-			dataType, 
+			targetAddr,
+			realStackAddr,
+			dataType,
 			valueToWrite,
 			useHooks
 		);
@@ -1321,7 +1307,7 @@ void LLVMBasicBlockLifter::LiftVmJmpIndirect(bool logDebugMessage, const VmJmpDa
 	// 3. Пишем адрес в аллоку targetVip, чтобы диспетчер его увидел
 	builder->CreateStore(targetAddr, targetVip);
 
-	
+
 	auto* realStackI8 = builder->CreateBitCast(
 		realStackPtr,
 		i8->getPointerTo()
@@ -1330,7 +1316,7 @@ void LLVMBasicBlockLifter::LiftVmJmpIndirect(bool logDebugMessage, const VmJmpDa
 	int index = 0;
 	int64_t tempOffset = realStackOffset;
 	for (auto& slot : shadowStack) {
-		if (index >= shadowStack.Size() - 19) break;
+		if (index++ >= shadowStack.Size() - 19) break;
 		tempOffset -= slot.bitDepth;
 		auto* realStackGep = builder->CreateConstGEP1_64(
 			i8,
@@ -1363,7 +1349,28 @@ void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& da
 			"native_reg_" + reg.name
 		);
 
-		builder->CreateStore(value, regPtr);
+		auto& addrMeta = slot.metadata.addressMeta;
+		if (!addrMeta.isInStackAddress) {
+			builder->CreateStore(value, regPtr);
+			continue;
+		}
+
+		auto* realStackAddrI8 = builder->CreateBitCast(
+			realStackPtr,
+			i8->getPointerTo(),
+			"real_stack_i8"
+		);
+		auto* realStackAddrGep = builder->CreateConstInBoundsGEP1_64(
+			i8,
+			realStackAddrI8,
+			addrMeta.slotAbsoluteBase + addrMeta.relativeOffset,
+			"real_stack_typed_gep"
+		);
+		auto* addrValue = builder->CreatePtrToInt(
+			realStackAddrGep,
+			i64
+		);
+		builder->CreateStore(addrValue, regPtr);
 	}
 
 	// 2. Выгружаем адрес выхода (VmExitAddr)
@@ -1418,5 +1425,5 @@ void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& da
 	//	}
 	//}
 
-	
+
 }
