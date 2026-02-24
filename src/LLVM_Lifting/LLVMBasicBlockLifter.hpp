@@ -5,6 +5,24 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Intrinsics.h>
+#include "ShadowStack.hpp"
+
+struct BasicBlockLifterConstructor {
+	llvm::LLVMContext* context;
+	llvm::Module* llvmModule;
+	llvm::IRBuilder<>* builder;
+	llvm::Function* function;
+
+	llvm::Value* vsp_ptr;
+	llvm::Value* vspBasePtr;
+	llvm::Value* nativeContext;
+	llvm::Type* nativeContextType;
+	llvm::Value* virtualContext;
+	llvm::Value* realStackPtr;
+
+	llvm::Value* imageBaseDif;
+	llvm::Value* targetVip;
+};
 
 class LLVMBasicBlockLifter {
 	llvm::LLVMContext* context;
@@ -14,11 +32,13 @@ class LLVMBasicBlockLifter {
 
 	llvm::Value* vspPtr;
 	llvm::Value* vspBasePtr;
-	int64_t stackOffset = 0;
+	llvm::Value* virtualContext;
 	llvm::Value* nativeContext;
 	llvm::Type* nativeContextType;
 	llvm::Value* imageBaseDif;
 	llvm::Value* targetVip;
+	llvm::Value* realStackPtr;
+
 private:
 	llvm::Type* i64;
 	llvm::Type* i32;
@@ -37,52 +57,34 @@ private:
 			ADD, NOR, NAND, SHL, SHR, SHLD, SHRD
 		} operation;
 	};
-
-	struct ShadowStackSlot {
-		llvm::Value* value{ nullptr };
-		int64_t bitDepth{ BitDepth_64 };
+	struct StackAddressMeta {
 		bool isInStackAddress{ false }; // Является ли это значение адресом в стеке (для оптимизаций доступа к стеку)
+		int32_t slotAbsoluteBase{ 0 };
+		int32_t relativeOffset{ 0 };
+	};
+	struct StackMetadata {
 		bool isPadding{ false };
-		int32_t slotAbsoluteBase{ 0 };
-		int32_t relativeOffset{ 0 };
-		ShadowStackSlot* isPointerToVirtualStackSlot{ nullptr }; // Если это значение является указателем на виртуальный стек, сохраняем указание на соответствующий слот
+		StackAddressMeta addressMeta;
 		std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
 	};
-	struct ShadowStackPop {
-		llvm::Value* value{ nullptr };
-		bool isInStackAddress{ false }; // Является ли это значение адресом в стеке (для оптимизаций доступа к стеку)
-		int32_t slotAbsoluteBase{ 0 };
-		int32_t relativeOffset{ 0 };
-		ShadowStackSlot* isPointerToVirtualStackSlot{ nullptr }; // Если это значение является указателем на виртуальный стек, сохраняем указание на соответствующий слот
-		std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
-	};
-	std::deque<ShadowStackSlot> shadowStack;
+	using ShadowStackType = ShadowStack<StackMetadata>;
+	ShadowStackType shadowStack;
 	static constexpr uint64_t fakeStackBase = 0x140000;
 
+
 private:
-	struct ShadowContextPartialWrite {
-		int32_t offset{ 0 };
-		int32_t width{ 0 };
-		llvm::Value* value{ nullptr };
-	};
-	struct ShadowContextSlot {
-		llvm::Value* baseValue{ nullptr };
-		ShadowStackSlot* isVspPointer{ nullptr }; // Является ли это значение указателем на стек (для оптимизаций доступа к стеку)
-		bool isInStackPointer{ false }; // Является ли это значение указателем, который может указывать в стек (для оптимизаций доступа к стеку)
-		int32_t slotAbsoluteBase{ 0 };
-		int32_t relativeOffset{ 0 };
-		std::vector<ShadowContextPartialWrite> partialWrites;
-	};
-	std::map<int32_t, ShadowContextSlot> shadowContext; // Ключ - смещение в структуре NativeContext
-	std::map<int32_t, FlagsPromise> registerFlagsPromises; // Если регистр, который обещает флаги, был перезаписан, сохраняем информацию о том, какие флаги он обещал, чтобы можно было попытаться восстановить эти флаги при необходимости
+	std::map<int32_t, StackAddressMeta> addressInRegMetas;
+	std::map<int32_t, FlagsPromise> calculateFlagsPromises; // Если регистр, который обещает флаги, был перезаписан, сохраняем информацию о том, какие флаги он обещал, чтобы можно было попытаться восстановить эти флаги при необходимости
+	
+	int64_t virtualStackOffset = 0;
+	int64_t realStackOffset{ 0 };
+	int64_t virtualToRealStackDif{ 0 };
 
 public:
-	LLVMBasicBlockLifter(llvm::LLVMContext* context, llvm::Module* llvmModule, llvm::IRBuilder<>* builder, llvm::Function* function,
-		llvm::Value* vsp_ptr, llvm::Value* vspBasePtr, llvm::Value* nativeContext, llvm::Type* nativeContextType, llvm::Value* imageBaseDif,
-		llvm::Value* targetVip);
+	LLVMBasicBlockLifter(const BasicBlockLifterConstructor& ctor);
 	
 	llvm::BasicBlock* LiftBasicBlock(const VirtualBasicBlock& vbb, bool useMemoryHooks = true, bool logMessages = false);
-	void FlushVsp(bool clearStack);
+	void FlushVsp(bool clearStack, bool writeToRealStack);
 private:
 #pragma region JIT Functions
 	llvm::FunctionCallee jitReadFunc;
@@ -133,40 +135,34 @@ private:
 	}
 
 #pragma region Shadow Stack Operations
-	void PushWithConstOffset(llvm::Value* value, HandlerBitDepth bitDepth);
-	void ShadowPush(llvm::Value* value, HandlerBitDepth bitDepth);
-	ShadowStackPop ShadowPop(HandlerBitDepth bitDepth);
+	void PushWithConstOffset(llvm::Value* value, HandlerBitDepth bitDepth, bool actuallyWriteToRealStack);
+	void Push(llvm::Value* value, HandlerBitDepth bitDepth) {
+		StackMetadata meta;
+		shadowStack.Push(bitDepth, value, meta);
+	}
+	
 	llvm::Value* PopWithConstOffset(HandlerBitDepth bitDepth);
-	uint64_t GetFullShadowStackSize() {
-		uint64_t fullSize = 0;
-		for (auto& slot : shadowStack) {
-			fullSize += (slot.bitDepth / 8);
-		}
-		return fullSize;
+	ShadowStackType::PopType Pop(HandlerBitDepth bitDepth) {
+		return shadowStack.Pop(bitDepth);
 	}
 #pragma endregion
 
-	llvm::Value* GetCurrentVspVal();
 	llvm::Value* CalculateFlagsFromPromise(FlagsPromise& promise);
 	
 	void InitJitHooks();
 	void InitLogFunctions();
 	llvm::Value* PackFlags(llvm::Value* res, llvm::Value* cf, llvm::Value* of, llvm::Value* sf = nullptr, llvm::Value* zf = nullptr);
 	
-	std::pair<int, int64_t> FindSlotByOffset(ShadowStackSlot* startSlot, int64_t offset);
-	bool TryGenerateShadowStackAccess(
-		ShadowStackPop* targetAddr,
-		HandlerBitDepth dataType,
-		llvm::Value* valueToWrite
-		);
 	void GenerateMemoryAccess(
 		llvm::Value* targetAddr,
+		llvm::Value* realStackAddr,
 		llvm::Type* dataType,
 		llvm::Value* valueToWrite, // Если nullptr, то это READ
 		bool useHooks,
 		bool isProvenStackAddress);
 	void GenerateStackMemoryAccess(
 		llvm::Value* targetAddr,
+		llvm::Value* realStackAddr,
 		llvm::Type* dataType,
 		llvm::Value* valueToWrite, // Если nullptr, то это READ
 		bool useHooks

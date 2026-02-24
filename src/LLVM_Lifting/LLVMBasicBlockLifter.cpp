@@ -1,23 +1,24 @@
 #include "LLVMBasicBlockLifter.hpp"
 #include "NativeContext.hpp"
 
-LLVMBasicBlockLifter::LLVMBasicBlockLifter(llvm::LLVMContext* context, llvm::Module* llvmModule, llvm::IRBuilder<>* builder, llvm::Function* function,
-	llvm::Value* vsp_ptr, llvm::Value* vspBasePtr, llvm::Value* nativeContext, llvm::Type* nativeContextType, llvm::Value* imageBaseDif,
-	llvm::Value* targetVip)
+LLVMBasicBlockLifter::LLVMBasicBlockLifter(const BasicBlockLifterConstructor& ctor) : 
+	shadowStack(ctor.builder, std::bind(&LLVMBasicBlockLifter::PopWithConstOffset, this, std::placeholders::_1))
 {
 	using namespace llvm;
 
-	this->context = context;
-	this->llvmModule = llvmModule;
-	this->builder = builder;
-	this->function = function;
+	this->context = ctor.context;
+	this->llvmModule = ctor.llvmModule;
+	this->builder = ctor.builder;
+	this->function = ctor.function;
 
-	this->vspPtr = vsp_ptr;
-	this->vspBasePtr = vspBasePtr;
-	this->nativeContext = nativeContext;
-	this->nativeContextType = nativeContextType;
-	this->imageBaseDif = imageBaseDif;
-	this->targetVip = targetVip;
+	this->vspPtr = ctor.vsp_ptr;
+	this->vspBasePtr = ctor.vspBasePtr;
+	this->nativeContext = ctor.nativeContext;
+	this->nativeContextType = ctor.nativeContextType;
+	this->imageBaseDif = ctor.imageBaseDif;
+	this->targetVip = ctor.targetVip;
+	this->virtualContext = ctor.virtualContext;
+	this->realStackPtr = ctor.realStackPtr;
 
 	i64 = Type::getInt64Ty(*context);
 	i32 = Type::getInt32Ty(*context);
@@ -28,6 +29,17 @@ LLVMBasicBlockLifter::LLVMBasicBlockLifter(llvm::LLVMContext* context, llvm::Mod
 
 	InitJitHooks();
 	InitLogFunctions();
+}
+
+// Возвращает std::optional, если значение - константа, иначе nullopt
+std::optional<int64_t> GetConstantInt(llvm::Value* val) {
+	// Проверяем, является ли Value* экземпляром ConstantInt
+	if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(val)) {
+		// getSExtValue() - Sign Extended (со знаком). Важно для отрицательных смещений!
+		// getZExtValue() - Zero Extended (без знака).
+		return constInt->getSExtValue();
+	}
+	return std::nullopt;
 }
 
 void LLVMBasicBlockLifter::InitJitHooks() {
@@ -113,9 +125,9 @@ llvm::BasicBlock* LLVMBasicBlockLifter::LiftBasicBlock(const VirtualBasicBlock& 
 
 	auto* basicBlock = BasicBlock::Create(*context, "bb_lifted_" + std::to_string(vip), builder->GetInsertBlock()->getParent());
 	builder->SetInsertPoint(basicBlock);
-	shadowStack.clear();
-	shadowContext.clear();
-	registerFlagsPromises.clear();
+	shadowStack.Clear();
+	calculateFlagsPromises.clear();
+	addressInRegMetas.clear();
 
 	//llvm::Type* vmContextType = llvm::ArrayType::get(i8, 256);
 	//virtualContext = builder->CreateAlloca(vmContextType, nullptr, "virtual_ctx");
@@ -155,173 +167,49 @@ llvm::BasicBlock* LLVMBasicBlockLifter::LiftBasicBlock(const VirtualBasicBlock& 
 			break;
 		}
 
-		if (!shadowStack.empty()) {
-			auto& lastSlot = shadowStack.back();
-			if (lastSlot.value != nullptr &&
-				lastSlot.value->getType()->isPointerTy() &&
-				!lastSlot.isInStackAddress)
-				__debugbreak();
-		}
+		//if (!shadowStack.empty()) {
+		//	auto& lastSlot = shadowStack.back();
+		//	if (lastSlot.value != nullptr &&
+		//		lastSlot.value->getType()->isPointerTy() &&
+		//		!lastSlot.isInStackAddress)
+		//		__debugbreak();
+		//}
 		
 	}
 
 	return basicBlock;
 }
 
-void LLVMBasicBlockLifter::ShadowPush(llvm::Value* value, HandlerBitDepth bitDepth) {
-	ShadowStackSlot slot;
-	slot.bitDepth = bitDepth;
-	slot.value = value;
-	slot.isInStackAddress = false;
-	slot.isPointerToVirtualStackSlot = nullptr;
-	shadowStack.push_back(slot);
-}
-void LLVMBasicBlockLifter::PushWithConstOffset(llvm::Value* value, HandlerBitDepth bitDepth) {
+void LLVMBasicBlockLifter::PushWithConstOffset(llvm::Value* value, HandlerBitDepth bitDepth, bool actuallyWriteToRealStack) {
 	int64_t size = bitDepth / 8; // Упрощенно
-	stackOffset -= size;  // Стек растет вниз
+	virtualStackOffset -= size;  // Стек растет вниз
 
 	llvm::Value* baseAsI8Ptr = builder->CreateBitCast(vspPtr, i8->getPointerTo());
 
-	// 2. Используем GEP с ОДНИМ индексом
 	llvm::Value* ptr = builder->CreateConstInBoundsGEP1_64(
-		i8,          // Теперь мы говорим: "шагаем по i8"
-		baseAsI8Ptr, // От указателя i8*
-		stackOffset  // На offset шагов
+		i8,
+		baseAsI8Ptr,
+		virtualStackOffset
 	);
 
-	llvm::Value* typedPtr = builder->CreateBitCast(ptr, GetTypeByDepth(bitDepth)->getPointerTo());
-	if (value->getType()->isPointerTy()) {
-		value = builder->CreatePtrToInt(value, GetTypeByDepth(bitDepth), "push_with_const_offset_ptr_to_int");
-	}
+	llvm::Value* typedPtr = builder->CreateBitCast(
+		ptr, 
+		GetTypeByDepth(bitDepth)->getPointerTo()
+	);
 	builder->CreateStore(value, typedPtr);
-}
 
-bool isPowerOfTwo(unsigned long long x)
-{
-	return x != 0 && (x & (x - 1)) == 0;
-}
+	realStackOffset -= size;
 
-LLVMBasicBlockLifter::ShadowStackPop LLVMBasicBlockLifter::ShadowPop(HandlerBitDepth bitDepth) {
-	using namespace llvm;
-
-	if (shadowStack.empty()) {
-		ShadowStackPop result;
-		result.value = PopWithConstOffset(bitDepth);
-		result.isInStackAddress = false;
-		result.isPointerToVirtualStackSlot = nullptr;
-		result.slotAbsoluteBase = 0;
-		result.relativeOffset = 0;
-		return result;
-	}
-
-	auto& slot = shadowStack.back();
-	if (!isPowerOfTwo(bitDepth)) {
-		//__debugbreak();
-		assert(false && "Strange behaivour");
-	}
-	if (!isPowerOfTwo(slot.bitDepth)) {
-		//__debugbreak();
-		assert(false && "Strange behaivour");
-	}
-
-	if (slot.isPadding) {
-		__debugbreak();
-	}
-
-	if (slot.bitDepth == bitDepth) {
-		shadowStack.pop_back();
-		ShadowStackPop result;
-		result.value = slot.value;
-		result.isInStackAddress = slot.isInStackAddress;
-		result.flagsPromise = slot.flagsPromise;
-		result.isPointerToVirtualStackSlot = slot.isPointerToVirtualStackSlot;
-		result.slotAbsoluteBase = slot.slotAbsoluteBase;
-		result.relativeOffset = slot.relativeOffset;
-		return result;
-	}
-
-	if (slot.value->getType()->isPointerTy()) {
-		slot.value = builder->CreatePtrToInt(slot.value,
-			GetTypeByDepth((HandlerBitDepth)slot.bitDepth),
-			"shadow_pop_ptr_to_int"
+	if (actuallyWriteToRealStack) {
+		auto* realStackI8 = builder->CreateBitCast(realStackPtr, i8->getPointerTo(), "real_stack_i8");
+		auto* realStackGep = builder->CreateConstGEP1_64(i8, realStackI8, realStackOffset, "real_stack_gep");
+		auto* realTypedPtr = builder->CreateBitCast(
+			realStackGep,
+			GetTypeByDepth(bitDepth)->getPointerTo(),
+			"typed_real_stack_gep"
 		);
-		slot.isPointerToVirtualStackSlot = nullptr;
-		slot.isInStackAddress = false;
-		slot.flagsPromise.reset();
-		slot.slotAbsoluteBase = 0;
+		builder->CreateStore(value, realTypedPtr);
 	}
-
-	if (slot.bitDepth < bitDepth) {
-		auto currentBits = static_cast<HandlerBitDepth>(slot.bitDepth);
-		auto lowPart = ShadowPop(currentBits);
-		HandlerBitDepth neededBits = (HandlerBitDepth)(bitDepth - currentBits);
-		if (!isPowerOfTwo(neededBits)) {
-			//__debugbreak();
-			assert(false && "Strange behaivour");
-		}
-		//if (neededBits % 8 != 0) {
-		//	__debugbreak();
-		//	assert(false && "Strange behaivour");
-		//}
-		auto highPart = ShadowPop(neededBits);
-
-		llvm::Type* targetType = GetTypeByDepth(bitDepth);
-		llvm::Value* lowExt = builder->CreateZExt(lowPart.value, targetType, "merge_low_ext");
-		llvm::Value* highExt = builder->CreateZExt(highPart.value, targetType, "merge_high_ext");
-
-		llvm::Value* shiftAmt = builder->getIntN(targetType->getIntegerBitWidth(), currentBits);
-		llvm::Value* highShifted = builder->CreateShl(highExt, shiftAmt, "merge_high_shifted");
-
-		llvm::Value* result = builder->CreateOr(lowExt, highShifted, "merged_res");
-		ShadowStackPop finalResult;
-		finalResult.value = result;
-		finalResult.isInStackAddress = false;
-		finalResult.isPointerToVirtualStackSlot = nullptr;
-		return finalResult;
-	}
-
-	auto* fullVal = slot.value;
-	unsigned fullWidth = fullVal->getType()->getIntegerBitWidth();
-
-	auto* result = builder->CreateTrunc(
-		fullVal,
-		GetTypeByDepth(bitDepth),
-		"pop_slice"
-	);
-	// 2. Сдвигаем, чтобы получить остаток
-	auto* shiftAmt = builder->getIntN(fullWidth, bitDepth);
-	auto* remainingValHigh = builder->CreateLShr(fullVal, shiftAmt, "stack_rem_shifted");
-
-	unsigned newBitDepth = fullWidth - bitDepth;
-	if (!isPowerOfTwo(newBitDepth)) {
-		//__debugbreak();
-		assert(false && "Strange behaivour");
-	}
-
-	// Важно: GetTypeByDepth может вернуть стандартные типы, 
-	// но нам нужен точный IntegerType произвольной ширины для промежуточного хранения
-	auto* remainingValTrunc = builder->CreateTrunc(
-		remainingValHigh,
-		builder->getIntNTy(newBitDepth),
-		"stack_rem_trunc"
-	);
-
-	slot.bitDepth = newBitDepth; // Обновляем размер
-	slot.value = remainingValTrunc; // Теперь типы совпадают (i48 в слоте с depth 48)
-	slot.isInStackAddress = false;
-	slot.isPointerToVirtualStackSlot = nullptr;
-	slot.flagsPromise.reset();
-	slot.slotAbsoluteBase = 0;
-
-	if (slot.bitDepth == 0) {
-		shadowStack.pop_back();
-	}
-	ShadowStackPop finalResult;
-	finalResult.value = result;
-	finalResult.isInStackAddress = false;
-	finalResult.isPointerToVirtualStackSlot = nullptr;
-
-	return finalResult;
 }
 llvm::Value* LLVMBasicBlockLifter::PopWithConstOffset(HandlerBitDepth bitDepth) {
 	int64_t size = bitDepth / 8;
@@ -333,54 +221,59 @@ llvm::Value* LLVMBasicBlockLifter::PopWithConstOffset(HandlerBitDepth bitDepth) 
 	llvm::Value* ptr = builder->CreateConstInBoundsGEP1_64(
 		i8,          // Теперь мы говорим: "шагаем по i8"
 		baseAsI8Ptr, // От указателя i8*
-		stackOffset  // На offset шагов
+		virtualStackOffset  // На offset шагов
 	);
 
 	llvm::Value* typedPtr = builder->CreateBitCast(ptr, GetTypeByDepth(bitDepth)->getPointerTo());
 	llvm::Value* val = builder->CreateLoad(GetTypeByDepth(bitDepth), typedPtr);
 
 	// 2. Меняем оффсет в C++
-	stackOffset += size;
+	virtualStackOffset += size;
+	realStackOffset += size;
 	return val;
 }
-void LLVMBasicBlockLifter::FlushVsp(bool clearStack) {
-	if (shadowStack.empty()) return;
 
+void LLVMBasicBlockLifter::FlushVsp(bool clearStack, bool writeToRealStack) {
 	for (auto& slot : shadowStack) {
-		if (slot.flagsPromise.has_value()) continue;
-		if (slot.isPadding) {
-			stackOffset += slot.bitDepth;
+		auto& metadata = slot.metadata;
+		if (metadata.flagsPromise.has_value()) {
+			slot.value = CalculateFlagsFromPromise(*metadata.flagsPromise);
+		}
+		if (metadata.isPadding) {
+			virtualStackOffset += slot.bitDepth;
+			realStackOffset += slot.bitDepth;
 			continue;
 		}
-		if (slot.isInStackAddress) {
-			slot.value = CreateValueByDepth((HandlerBitDepth)slot.bitDepth, slot.slotAbsoluteBase + slot.relativeOffset);
+
+		auto& addressMeta = metadata.addressMeta;
+		if (addressMeta.isInStackAddress) {
+			auto* realStackAddrI8 = builder->CreateBitCast(
+				realStackPtr, 
+				i8->getPointerTo(), 
+				"real_stack_i8"
+			);
+			auto* realStackAddrGep = builder->CreateConstInBoundsGEP1_64(
+				i8,
+				realStackAddrI8,
+				addressMeta.slotAbsoluteBase + addressMeta.relativeOffset,
+				"real_stack_typed_gep"
+			);
+			slot.value = builder->CreatePtrToInt(
+				realStackAddrGep,
+				GetTypeByDepth((HandlerBitDepth)slot.bitDepth)
+			);
 		}
 
-		PushWithConstOffset(slot.value, static_cast<HandlerBitDepth>(slot.bitDepth));
+		PushWithConstOffset(
+			slot.value, 
+			static_cast<HandlerBitDepth>(slot.bitDepth), 
+			writeToRealStack
+		);
 	}
 	
-	if (clearStack) shadowStack.clear();
+	if (clearStack) shadowStack.Clear();
 }
-llvm::Value* LLVMBasicBlockLifter::GetCurrentVspVal() {
-	using namespace llvm;
 
-	Value* baseVsp = vspPtr; //builder->CreateLoad(ptrTy, vspPtr, "vsp_base_load");
-	int64_t stackOffsetWithShadowStack = stackOffset - GetFullShadowStackSize();
-
-	if (stackOffsetWithShadowStack == 0)
-		return builder->CreateBitCast(baseVsp, ptrTy);
-
-	llvm::Value* baseI8 = builder->CreateBitCast(baseVsp, builder->getInt8PtrTy());
-
-	llvm::Value* currentVspI8 = builder->CreateConstInBoundsGEP1_64(
-		builder->getInt8Ty(),
-		baseI8,
-		stackOffsetWithShadowStack,
-		"vsp_current_offset"
-	);
-
-	return builder->CreateBitCast(currentVspI8, ptrTy);
-}
 llvm::Value* LLVMBasicBlockLifter::PackFlags(llvm::Value* res, llvm::Value* cf, llvm::Value* of, llvm::Value* sf, llvm::Value* zf) {
 	using namespace llvm;
 	llvm::Value* flags = builder->getInt64(0);
@@ -406,109 +299,55 @@ void LLVMBasicBlockLifter::LiftVmPop(bool logDebugMessage, const HandlerMatch& m
 	auto& data = std::get<VmPopRegData>(match.matchData);
 	// 1. Выравнивание (Align down to 8 bytes)
 	int32_t baseOffset = (data.offset / 8) * 8;
-	int32_t relativeOffset = data.offset % 8; // Смещение внутри 64-битного слота
-
-	//if (baseOffset == 8 && match.bitDepth == BitDepth_64) {
-	//	__debugbreak();
-	//}
 
 	auto popDepth = match.bitDepth == BitDepth_8 ? BitDepth_16 : match.bitDepth; // Если 8 бит, то читаем 16 бит для выравнивания
-	auto popResult = ShadowPop(popDepth);
+	auto popResult = Pop(popDepth);
+
+	if (calculateFlagsPromises.contains(baseOffset)) {
+		calculateFlagsPromises.erase(baseOffset);
+	}
+
+	if (popResult.metadata.flagsPromise.has_value()) {
+		calculateFlagsPromises[baseOffset] = popResult.metadata.flagsPromise.value();
+		return;
+	}
+
+	if (popResult.value->getType()->isPointerTy()) {
+		popResult.value = builder->CreatePtrToInt(
+			popResult.value,
+			GetTypeByDepth(popDepth),
+			"pop_ptr_to_int"
+		);
+	}
+
 	if (match.bitDepth == BitDepth_8) {
 		// Если нам нужно 8 бит, а в стеке 16 бит, то извлекаем нужные 8 бит из результата
-		popResult.value = builder->CreateTrunc(popResult.value, i8, "pop_trunc_8");
+		popResult.value = builder->CreateTrunc(
+			popResult.value,
+			i8,
+			"pop_trunc_8"
+		);
 	}
 
-	if (registerFlagsPromises.contains(baseOffset)) {
-		registerFlagsPromises.erase(baseOffset);
-	}
+	auto* virtualContextI8 = builder->CreateBitCast(virtualContext, i8->getPointerTo());
+	auto* slotPtrI8 = builder->CreateConstInBoundsGEP1_32(i8, virtualContextI8, data.offset);
+	auto* storeType = GetTypeByDepth(match.bitDepth);
+	auto* typedSlotPtr = builder->CreateBitCast(slotPtrI8, storeType->getPointerTo());
+	builder->CreateStore(popResult.value, typedSlotPtr);
 
-	if (popResult.flagsPromise.has_value()) {
-		registerFlagsPromises[baseOffset] = popResult.flagsPromise.value();
-		return;
-	}
-
-	if (match.bitDepth == BitDepth_64 && relativeOffset != 0) {
-		__debugbreak();
-		assert(false && "Strange behaivour");
-		return;
-	}
-
-	auto slot = shadowContext.find(baseOffset);
-	if (slot == shadowContext.end()){
-		ShadowContextSlot newSlot;
-		if (match.bitDepth == BitDepth_64) {
-			newSlot.baseValue = popResult.value;
-			newSlot.isVspPointer = popResult.isPointerToVirtualStackSlot;
-			newSlot.isInStackPointer = popResult.isInStackAddress;
-			newSlot.slotAbsoluteBase = popResult.slotAbsoluteBase;
-			newSlot.relativeOffset = popResult.relativeOffset;
-		}
-		else {
-			ShadowContextPartialWrite partialWrite;
-			partialWrite.offset = relativeOffset;
-			partialWrite.width = match.bitDepth / 8;
-			partialWrite.value = popResult.value;
-			newSlot.partialWrites.push_back(partialWrite);
-		}
-		shadowContext[baseOffset] = newSlot;
+	if (popResult.metadata.addressMeta.isInStackAddress) {
+		addressInRegMetas[baseOffset] = popResult.metadata.addressMeta;
 	}
 	else {
-		int32_t newWidth = match.bitDepth / 8; // В байтах
-		int32_t newStart = relativeOffset;
-		int32_t newEnd = newStart + newWidth;
-		// Удаляем все частичные записи, которые полностью перекрываются новой записью
-		slot->second.partialWrites.erase(
-			std::remove_if(
-				slot->second.partialWrites.begin(),
-				slot->second.partialWrites.end(),
-				[newStart, newEnd](const ShadowContextPartialWrite& pw) {
-					int32_t pwStart = pw.offset;
-					int32_t pwEnd = pw.offset + (pw.width / 8);
-					return pwStart >= newStart && pwEnd <= newEnd;
-				}
-			),
-			slot->second.partialWrites.end()
-		);
-
-		slot->second.isVspPointer = nullptr;
-		slot->second.isInStackPointer = false;
-		slot->second.slotAbsoluteBase = 0;
-		slot->second.relativeOffset = 0;
-
-		if (match.bitDepth == BitDepth_64) {
-			slot->second.baseValue = popResult.value;
-			slot->second.isVspPointer = popResult.isPointerToVirtualStackSlot;
-			slot->second.isInStackPointer = popResult.isInStackAddress;
-			slot->second.partialWrites.clear();
-			slot->second.slotAbsoluteBase = popResult.slotAbsoluteBase;
-			slot->second.relativeOffset = popResult.relativeOffset;
-		}
-		else {
-			auto& partialWrites = slot->second.partialWrites;
-			ShadowContextPartialWrite partialWrite;
-			partialWrite.offset = relativeOffset;
-			partialWrite.width = match.bitDepth / 8;
-			partialWrite.value = popResult.value;
-			bool writeFound = false;
-			for (auto& pw : partialWrites) {
-				if (partialWrite.offset == pw.offset &&
-					partialWrite.width == pw.width) {
-					pw.value = popResult.value;
-					writeFound = true;
-				}
-			}
-
-			if (!writeFound)
-				partialWrites.push_back(partialWrite);
-		}
+		addressInRegMetas.erase(baseOffset);
 	}
 
 	// --- LOGGING ---
 	if (logDebugMessage) {
-		llvm::Value* val64 = (popResult.value->getType()->isIntegerTy(64))
-			? popResult.value
-			: builder->CreateZExt(popResult.value, builder->getInt64Ty(), "log_val_ext");
+		llvm::Value* val64 = popResult.value;
+		if (match.bitDepth != BitDepth_64) {
+			val64 = builder->CreateZExt(val64, i64);
+		}
 
 		builder->CreateCall(jitLogPop, {
 			builder->getInt32(match.bitDepth),
@@ -524,159 +363,46 @@ void LLVMBasicBlockLifter::LiftVmPushReg(bool logDebugMessage, const HandlerMatc
 
 	llvm::Value* valueToPush = nullptr;
 	int32_t baseOffset = (data.regOffset / 8) * 8;
-	int32_t relativeOffset = data.regOffset % 8; // Смещение внутри 64-битного слота
-	if (relativeOffset < 0 || relativeOffset > 8) {
-		__debugbreak();
-	}
-	if (baseOffset < 0 || baseOffset > 256) {
-		__debugbreak();
-	}
 
-	bool isFlagPromise = registerFlagsPromises.contains(baseOffset);
-	auto slot = shadowContext.find(baseOffset);
+	auto* virtualContextI8 = builder->CreateBitCast(virtualContext, i8->getPointerTo());
+	auto* slotPtrI8 = builder->CreateConstInBoundsGEP1_32(i8, virtualContextI8, data.regOffset);
+	auto* loadType = GetTypeByDepth(match.bitDepth);
+	auto* typedSlotPtr = builder->CreateBitCast(slotPtrI8, loadType->getPointerTo());
+
+	bool isFlagPromise = calculateFlagsPromises.contains(baseOffset);
 	if (match.bitDepth == BitDepth_64 && isFlagPromise) {
-		auto& promise = registerFlagsPromises[baseOffset];
-		if (promise.res == nullptr) promise.res = CalculateFlagsFromPromise(promise);
-		ShadowStackSlot newSlot;
-		newSlot.value = promise.res;
-		newSlot.bitDepth = BitDepth_64;
-		newSlot.isInStackAddress = false;
-		newSlot.isPointerToVirtualStackSlot = nullptr;
-		shadowStack.push_back(newSlot);
-
-		if (slot != shadowContext.end()) {
-			slot->second.baseValue = promise.res;
-			slot->second.isInStackPointer = false;
-			slot->second.isVspPointer = nullptr;
-			slot->second.partialWrites.clear();
-			slot->second.relativeOffset = 0;
-			slot->second.slotAbsoluteBase = 0;
-			registerFlagsPromises.erase(baseOffset);
-		}
+		auto& promise = calculateFlagsPromises[baseOffset];
 		
+		if (promise.res == nullptr) {
+			promise.res = CalculateFlagsFromPromise(promise);
+			builder->CreateStore(promise.res, typedSlotPtr);
+		}
+
+		Push(promise.res, BitDepth_64);
 		return;
 	}
 
+	auto pushDepth = match.bitDepth == BitDepth_8 ? BitDepth_16 : match.bitDepth;
+
+	valueToPush = builder->CreateLoad(loadType, typedSlotPtr);
+	if (match.bitDepth == BitDepth_8) {
+		valueToPush = builder->CreateZExt(valueToPush, i16);
+	}
+
+	StackMetadata meta;
+	auto addressMeta = addressInRegMetas.find(baseOffset);
+	if (addressMeta != addressInRegMetas.end()) {
+		meta.addressMeta = addressMeta->second;
+	}
+
+	shadowStack.Push(pushDepth, valueToPush, meta);
 	
-	
-	bool hasNoPartialWrites = slot->second.partialWrites.empty();
-	bool hasPartialWrites = !hasNoPartialWrites;
-
-	if (match.bitDepth == BitDepth_64 && slot->second.baseValue && !isFlagPromise && hasNoPartialWrites ) {
-		ShadowStackSlot newSlot;
-		newSlot.value = slot->second.baseValue;
-		newSlot.bitDepth = BitDepth_64;
-		newSlot.isInStackAddress = slot->second.isInStackPointer;
-		newSlot.isPointerToVirtualStackSlot = slot->second.isVspPointer;
-		newSlot.slotAbsoluteBase = slot->second.slotAbsoluteBase;
-		newSlot.relativeOffset = slot->second.relativeOffset;
-		valueToPush = slot->second.baseValue;
-		shadowStack.push_back(newSlot);
-	}
-
-
-	bool matchFoundInPartialWrites = false;
-	if (hasPartialWrites && match.bitDepth != BitDepth_64 && valueToPush == nullptr) {
-		auto& partialWrites = slot->second.partialWrites;
-		auto pushDepth = match.bitDepth == BitDepth_8 ? BitDepth_16 : match.bitDepth;
-		for (auto& pw : partialWrites) {
-			if (pw.offset == relativeOffset && pw.width * 8 == match.bitDepth) {
-				ShadowStackSlot newSlot;
-				newSlot.value = pw.value;
-				if (match.bitDepth == BitDepth_8) {
-					newSlot.value = builder->CreateZExt(newSlot.value, i16, "push_reg_ext_8_to_16");
-				}
-				newSlot.bitDepth = pushDepth;
-				newSlot.isInStackAddress = false;
-				newSlot.isPointerToVirtualStackSlot = nullptr;
-				newSlot.slotAbsoluteBase = 0;
-				valueToPush = newSlot.value;
-				shadowStack.push_back(newSlot);
-				matchFoundInPartialWrites = true;
-				break;
-			}
-		}
-	}
-
-	if (!matchFoundInPartialWrites && valueToPush == nullptr) {
-		// Если у нас есть частичные записи, но ни одна из них не совпала с нашим смещением и размером, это может означать, что мы пытаемся прочитать часть регистра, которая была частично перезаписана. В этом случае нам нужно собрать полное значение регистра, учитывая все частичные записи, и затем извлечь нужную часть.
-		llvm::Value* fullRegVal = slot->second.baseValue;
-		auto& partialWrites = slot->second.partialWrites;
-		slot->second.isInStackPointer = false;
-		slot->second.isVspPointer = nullptr;
-		if (fullRegVal == nullptr) {
-			fullRegVal = builder->getInt64(0); // Если базового значения нет, начинаем с 0
-		}
-		else {
-			if (fullRegVal->getType()->isPointerTy())
-				fullRegVal = builder->CreatePtrToInt(fullRegVal, i64, "full_reg_ptr_to_int");
-
-			if (fullRegVal->getType()->getIntegerBitWidth() < 64) {
-				fullRegVal = builder->CreateZExt(fullRegVal, i64, "full_reg_ext");
-			}
-		}
-		
-		for (auto& pw : partialWrites) {
-			uint64_t widthBits = pw.width * 8;
-			uint64_t maskRaw = (widthBits == 64) ? -1ULL : ((1ULL << widthBits) - 1);
-
-			llvm::APInt maskAPI(64, maskRaw);
-			maskAPI = maskAPI.shl(pw.offset * 8);
-
-			llvm::Value* preserveMask = builder->getIntN(64, ~maskAPI.getZExtValue());
-
-			// Clear: удаляем биты там, куда будем писать
-			fullRegVal = builder->CreateAnd(fullRegVal, preserveMask, "collapse_clear");
-
-			// Prepare value: берем значение, кастуем к i64, сдвигаем
-			llvm::Value* valToWrite = pw.value;
-			if (valToWrite->getType()->isPointerTy()) valToWrite = builder->CreatePtrToInt(valToWrite, i64);
-			else if (valToWrite->getType()->getIntegerBitWidth() < 64) valToWrite = builder->CreateZExt(valToWrite, i64);
-
-			llvm::Value* shiftedVal = builder->CreateShl(valToWrite, pw.offset * 8, "collapse_shl");
-
-			// Insert: вставляем новые биты
-			fullRegVal = builder->CreateOr(fullRegVal, shiftedVal, "collapse_or");
-		}
-
-		auto* resultVal = fullRegVal;
-		slot->second.baseValue = fullRegVal;
-		slot->second.partialWrites.clear();
-
-		if (relativeOffset > 0) {
-			resultVal = builder->CreateLShr(resultVal, relativeOffset * 8, "extract_shr");
-		}
-
-		if (match.bitDepth != BitDepth_64) {
-			resultVal = builder->CreateTrunc(resultVal, GetTypeByDepth(match.bitDepth), "extract_trunc");
-		}
-
-		auto pushDepth = match.bitDepth;
-		if (match.bitDepth == BitDepth_8) {
-			resultVal = builder->CreateZExt(resultVal, i16, "extract_ext_8_to_16");
-			pushDepth = BitDepth_16;
-		}
-
-		ShadowStackSlot newSlot;
-		newSlot.value = resultVal;
-		newSlot.bitDepth = pushDepth;
-		newSlot.isInStackAddress = false;
-		newSlot.isPointerToVirtualStackSlot = nullptr;
-		newSlot.slotAbsoluteBase = hasNoPartialWrites ? slot->second.slotAbsoluteBase : 0;
-		newSlot.relativeOffset = hasNoPartialWrites ? slot->second.relativeOffset : 0;
-		valueToPush = resultVal;
-		shadowStack.push_back(newSlot);
-	}
-
 	// --- LOGGING ---
 	if (logDebugMessage) {
-		if (valueToPush->getType()->isPointerTy()) {
-			valueToPush = builder->CreatePtrToInt(valueToPush, i64, "log_push_ptr_to_int");
+		llvm::Value* val64 = valueToPush;
+		if (match.bitDepth != BitDepth_64) {
+			val64 = builder->CreateZExt(val64, i64);
 		}
-
-		llvm::Value* val64 = (valueToPush->getType()->isIntegerTy(64))
-			? valueToPush
-			: builder->CreateZExt(valueToPush, i64, "log_val_ext");
 
 		builder->CreateCall(jitLogPushReg, {
 			builder->getInt32(match.bitDepth),
@@ -703,11 +429,11 @@ void LLVMBasicBlockLifter::LiftVmPushConst(bool logDebugMessage, const HandlerMa
 		// Правило 2: Константа 8 бит, но в стек кладем 16 бит
 		// Создаем сразу i16 константу (маскируя лишнее, если нужно)
 		llvm::Value* constVal16 = builder->getInt16(static_cast<uint8_t>(data.value));
-		ShadowPush(constVal16, BitDepth_16);
+		Push(constVal16, BitDepth_16);
 	}
 	else {
 		llvm::Value* constVal = CreateValueByDepth(match.bitDepth, data.value);
-		ShadowPush(constVal, match.bitDepth);
+		Push(constVal, match.bitDepth);
 	}
 }
 
@@ -875,19 +601,22 @@ llvm::Value* LLVMBasicBlockLifter::CalculateFlagsFromPromise(FlagsPromise& promi
 }
 
 void LLVMBasicBlockLifter::LiftVmPushVsp(bool logDebugMessage, const HandlerMatch& match) {
-	// Читаем текущий адрес стека (значение переменной vsp_ptr)
-	llvm::Value* currentVsp = builder->CreateBitCast(vspPtr, ptrTy);
-
-	// Превращаем указатель в число (ptr -> i64), чтобы положить в стек
-	//llvm::Value* vspAsInt = builder->CreatePtrToInt(currentVsp, GetTypeByDepth(match.bitDepth), "vsp_int");
+	
+	auto shadowStackSize = shadowStack.GetFullShadowStackSize();
+	auto finalOffset = virtualStackOffset - shadowStackSize;
 
 	// --- LOGGING ---
 	if (logDebugMessage) {
+		// Читаем текущий адрес стека (значение переменной vsp_ptr)
+		llvm::Value* currentVsp = builder->CreateBitCast(vspPtr, ptrTy);
+
 		llvm::Value* vspAsInt = builder->CreatePtrToInt(currentVsp, GetTypeByDepth(match.bitDepth), "vsp_int");
 		llvm::Value* val64 = (vspAsInt->getType()->isIntegerTy(64))
 			? vspAsInt
 			: builder->CreateZExt(vspAsInt, builder->getInt64Ty());
 
+		auto* offset = builder->getInt64(finalOffset);
+		val64 = builder->CreateAdd(val64, offset);
 		builder->CreateCall(jitLogPushVsp, {
 			builder->getInt32(match.bitDepth),
 			val64
@@ -896,27 +625,29 @@ void LLVMBasicBlockLifter::LiftVmPushVsp(bool logDebugMessage, const HandlerMatc
 
 	auto pushDepth = match.bitDepth == BitDepth_8 ? BitDepth_16 : match.bitDepth;
 
-	ShadowStackSlot slot;
-	slot.value = currentVsp;
-	if (match.bitDepth != BitDepth_64) {
-		slot.value = builder->CreatePtrToInt(currentVsp, GetTypeByDepth(pushDepth), "vsp_int_for_push");
-	}
-	slot.bitDepth = pushDepth;
-	slot.isInStackAddress = match.bitDepth == BitDepth_64;
-	slot.isPointerToVirtualStackSlot = nullptr;
-	slot.slotAbsoluteBase = stackOffset - GetFullShadowStackSize();
-	if (!shadowStack.empty()) {
-		slot.isPointerToVirtualStackSlot = match.bitDepth == BitDepth_64 ? 
-			&shadowStack.back() : 
-			nullptr;
-	}
-	
-	shadowStack.push_back(slot);
+	StackMetadata metadata;
+	metadata.addressMeta.isInStackAddress = match.bitDepth == BitDepth_64;
+	metadata.addressMeta.slotAbsoluteBase = finalOffset;
+
+	auto* vspValue = CreateValueByDepth(
+		pushDepth,
+		fakeStackBase + finalOffset
+	);
+
+
+	shadowStack.Push(pushDepth, vspValue, metadata);
 }
 void LLVMBasicBlockLifter::LiftVmPopVsp(bool logDebugMessage, const HandlerMatch& match) {
 	auto vspPopData = std::get<VmPopVspData>(match.matchData);
 	
-	ShadowPop(match.bitDepth);
+	int64_t offset = vspPopData.offset;
+
+	auto targetAddr = Pop(match.bitDepth).value;
+	auto constTargetAddr = GetConstantInt(targetAddr);
+	if (constTargetAddr) {
+		uint64_t currentAddr = fakeStackBase - virtualStackOffset - shadowStack.GetFullShadowStackSize();
+		offset = *constTargetAddr - currentAddr;
+	}
 
 	if (vspPopData.offset > 0) {
 		__debugbreak(); //TODO: обрезание теневого стека
@@ -928,62 +659,60 @@ void LLVMBasicBlockLifter::LiftVmPopVsp(bool logDebugMessage, const HandlerMatch
 
 	builder->CreateCall(jitLogPopVsp, {
 		builder->getInt32(match.bitDepth),
-		builder->getInt64(vspPopData.offset) // Логируем смещение, на которое был изменен VSP
+		builder->getInt64(offset) // Логируем смещение, на которое был изменен VSP
 	});
 	// ----------------
 
-	// Превращаем число обратно в указатель (i64 -> i64*)
-	//llvm::Value* newVspPtr = builder->CreateIntToPtr(newVspInt, ptrTy, "new_vsp_ptr");
 
-	// Обновляем переменную vspPtrAddr
-	//builder->CreateStore(newVspPtr, vspPtr);
+	StackMetadata meta;
+	meta.isPadding = true;
 
-	ShadowStackSlot slot;
-	slot.bitDepth = vspPopData.offset;
-	slot.isPadding = true;
-	shadowStack.push_back(slot);
 
-	//stackOffset += vspPopData.offset;
+
+	shadowStack.Push(
+		(HandlerBitDepth)offset,
+		nullptr,
+		meta);
 }
 
 void LLVMBasicBlockLifter::LiftVmReadMem(bool logDebugMessage, const HandlerMatch& match) {
-	auto addrSlot = ShadowPop(BitDepth_64);
-	if (TryGenerateShadowStackAccess(&addrSlot, match.bitDepth, nullptr)) {
-		return;
-	}
+	auto addrSlot = Pop(BitDepth_64);
+	auto& addrMeta = addrSlot.metadata.addressMeta;
 
 	auto* targetAddr = addrSlot.value;
-	if (addrSlot.slotAbsoluteBase) {
-		targetAddr = builder->CreateBitCast(targetAddr, i8->getPointerTo());
-		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, targetAddr, addrSlot.slotAbsoluteBase + addrSlot.relativeOffset);
+	if (addrMeta.isInStackAddress) {
+		int64_t fullOffset = addrMeta.slotAbsoluteBase + addrMeta.relativeOffset;
+		auto* stackBaseI8 = builder->CreateBitCast(vspPtr, i8->getPointerTo());
+		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, stackBaseI8, fullOffset);
 	}
 
 	GenerateMemoryAccess(
 		targetAddr,
+		nullptr,
 		GetTypeByDepth(match.bitDepth),
 		nullptr,
 		false,
-		addrSlot.isInStackAddress // <--- Передаем флаг
+		addrMeta.isInStackAddress // <--- Передаем флаг
 	);
 }
 void LLVMBasicBlockLifter::LiftVmReadMemHooked(bool logDebugMessage, const HandlerMatch& match) {
-	auto addrSlot = ShadowPop(BitDepth_64);
-	if (TryGenerateShadowStackAccess(&addrSlot, match.bitDepth, nullptr)) {
-		return;
-	}
+	auto addrSlot = Pop(BitDepth_64);
+	auto& addrMeta = addrSlot.metadata.addressMeta;
 
 	auto* targetAddr = addrSlot.value;
-	if (addrSlot.slotAbsoluteBase) {
-		targetAddr = builder->CreateBitCast(targetAddr, i8->getPointerTo());
-		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, targetAddr, addrSlot.slotAbsoluteBase + addrSlot.relativeOffset);
+	if (addrMeta.isInStackAddress) {
+		int64_t fullOffset = addrMeta.slotAbsoluteBase + addrMeta.relativeOffset;
+		auto* stackBaseI8 = builder->CreateBitCast(vspPtr, i8->getPointerTo());
+		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, stackBaseI8, fullOffset);
 	}
 
 	GenerateMemoryAccess(
 		targetAddr,
+		nullptr,
 		GetTypeByDepth(match.bitDepth),
 		nullptr,
 		true,
-		addrSlot.isInStackAddress // <--- Передаем флаг
+		addrMeta.isInStackAddress // <--- Передаем флаг
 	);
 
 }
@@ -991,71 +720,83 @@ void LLVMBasicBlockLifter::LiftVmWriteMem(bool logDebugMessage, const HandlerMat
 	llvm::Value* val;
 	llvm::Type* type;
 
-	auto addrSlot = ShadowPop(BitDepth_64);
+	auto addrSlot = Pop(BitDepth_64);
 
 	if (match.bitDepth == BitDepth_8) {
 		// Пишем 8 бит, но на стеке лежит 16
-		llvm::Value* val16 = ShadowPop(BitDepth_16).value;
+		llvm::Value* val16 = Pop(BitDepth_16).value;
 		val = builder->CreateTrunc(val16, i8);
 		type = i8;
 	}
 	else {
-		val = ShadowPop(match.bitDepth).value;
+		val = Pop(match.bitDepth).value;
 		type = GetTypeByDepth(match.bitDepth);
 	}
 
-	if (TryGenerateShadowStackAccess(&addrSlot, match.bitDepth, val)) {
-		return;
-	}
+	auto& addrMeta = addrSlot.metadata.addressMeta;
 
 	auto* targetAddr = addrSlot.value;
-	if (addrSlot.slotAbsoluteBase) {
-		targetAddr = builder->CreateBitCast(targetAddr, i8->getPointerTo());
-		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, targetAddr, addrSlot.slotAbsoluteBase + addrSlot.relativeOffset);
+	llvm::Value* realStackAddr = nullptr;
+	if (addrMeta.isInStackAddress) {
+		int64_t fullOffset = addrMeta.slotAbsoluteBase + addrMeta.relativeOffset;
+
+		auto* stackBaseI8 = builder->CreateBitCast(vspPtr, i8->getPointerTo());
+		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, stackBaseI8, fullOffset);
+
+		auto* realStackI8 = builder->CreateBitCast(realStackPtr, i8->getPointerTo());
+		realStackAddr = builder->CreateConstInBoundsGEP1_32(i8, realStackI8, fullOffset);
 	}
 
-	GenerateMemoryAccess(targetAddr, type, val, false, addrSlot.isInStackAddress);
+	GenerateMemoryAccess(
+		targetAddr,
+		realStackAddr,
+		type,
+		val,
+		false,
+		addrMeta.isInStackAddress
+	);
 }
 void LLVMBasicBlockLifter::LiftVmWriteMemHooked(bool logDebugMessage, const HandlerMatch& match) {
 	llvm::Value* val;
 	llvm::Type* type;
 
-	auto addrSlot = ShadowPop(BitDepth_64);
+	auto addrSlot = Pop(BitDepth_64);
 
 	if (match.bitDepth == BitDepth_8) {
 		// Пишем 8 бит, но на стеке лежит 16
-		llvm::Value* val16 = ShadowPop(BitDepth_16).value;
+		llvm::Value* val16 = Pop(BitDepth_16).value;
 		val = builder->CreateTrunc(val16, i8);
 		type = i8;
 	}
 	else {
-		val = ShadowPop(match.bitDepth).value;
+		val = Pop(match.bitDepth).value;
 		type = GetTypeByDepth(match.bitDepth);
 	}
 
-	if (TryGenerateShadowStackAccess(&addrSlot, match.bitDepth, val)) {
-		return;
-	}
+	auto& addrMeta = addrSlot.metadata.addressMeta;
 
 	auto* targetAddr = addrSlot.value;
-	if (addrSlot.slotAbsoluteBase) {
-		targetAddr = builder->CreateBitCast(targetAddr, i8->getPointerTo());
-		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, targetAddr, addrSlot.slotAbsoluteBase + addrSlot.relativeOffset);
+	llvm::Value* realStackAddr = nullptr;
+	if (addrMeta.isInStackAddress) {
+		int64_t fullOffset = addrMeta.slotAbsoluteBase + addrMeta.relativeOffset;
+
+		auto* stackBaseI8 = builder->CreateBitCast(vspPtr, i8->getPointerTo());
+		targetAddr = builder->CreateConstInBoundsGEP1_32(i8, stackBaseI8, fullOffset);
+
+		auto* realStackI8 = builder->CreateBitCast(realStackPtr, i8->getPointerTo());
+		realStackAddr = builder->CreateConstInBoundsGEP1_32(i8, realStackI8, fullOffset);
 	}
 
-	GenerateMemoryAccess(targetAddr, type, val, true, addrSlot.isInStackAddress);
+	GenerateMemoryAccess(
+		targetAddr, 
+		realStackAddr,
+		type, 
+		val, 
+		true, 
+		addrMeta.isInStackAddress
+	);
 }
 
-// Возвращает std::optional, если значение - константа, иначе nullopt
-std::optional<int64_t> GetConstantInt(llvm::Value* val) {
-	// Проверяем, является ли Value* экземпляром ConstantInt
-	if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(val)) {
-		// getSExtValue() - Sign Extended (со знаком). Важно для отрицательных смещений!
-		// getZExtValue() - Zero Extended (без знака).
-		return constInt->getSExtValue();
-	}
-	return std::nullopt;
-}
 
 void LLVMBasicBlockLifter::LiftVmAdd(bool logDebugMessage, const HandlerMatch& match) {
 	using namespace llvm;
@@ -1066,63 +807,68 @@ void LLVMBasicBlockLifter::LiftVmAdd(bool logDebugMessage, const HandlerMatch& m
 	bool hasSignleVspOperand = false;
 
 	HandlerBitDepth popDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
-	auto valBSlot = ShadowPop(popDepth);
-	auto valASlot = ShadowPop(popDepth);
+	auto valBSlot = Pop(popDepth);
+	auto valASlot = Pop(popDepth);
 	valB = valBSlot.value;
 	valA = valASlot.value;
-	ShadowStackSlot* vspSlot = nullptr;
 	int64_t slotAbsoluteBase = 0;
-	int64_t relativeOffse = 0;
+	int64_t relativeOffset = 0;
 
 	llvm::Value* result = nullptr;
-	if (valBSlot.isInStackAddress && !valASlot.isInStackAddress) {
-		vspSlot = valBSlot.isPointerToVirtualStackSlot;
-		slotAbsoluteBase = valBSlot.slotAbsoluteBase;
-		result = valB;
-		valB = builder->getInt64(
-			fakeStackBase +
-			valBSlot.slotAbsoluteBase +
-			valBSlot.relativeOffset
-		);
+	auto& valBAddrMeta = valBSlot.metadata.addressMeta;
+	auto& valAAddrMeta = valASlot.metadata.addressMeta;
+
+	if (valBAddrMeta.isInStackAddress && !valAAddrMeta.isInStackAddress) {
+		slotAbsoluteBase = valBAddrMeta.slotAbsoluteBase;
+		//valB = builder->getInt64(
+		//	fakeStackBase +
+		//	valBAddrMeta.slotAbsoluteBase +
+		//	valBAddrMeta.relativeOffset
+		//);
 		hasSignleVspOperand = true;
 		auto constValue = GetConstantInt(valA);
-		if (constValue) relativeOffse = *constValue;
+		if (constValue) relativeOffset = valBAddrMeta.relativeOffset + *constValue;
+		else __debugbreak();
 	}
-	else if (valASlot.isInStackAddress && !valBSlot.isInStackAddress) {
-		vspSlot = valASlot.isPointerToVirtualStackSlot;
-		slotAbsoluteBase = valASlot.slotAbsoluteBase;
-		result = valA;
-		valA = builder->getInt64(
-			fakeStackBase + 
-			valASlot.slotAbsoluteBase + 
-			valASlot.relativeOffset
-		);
+	else if (valAAddrMeta.isInStackAddress && !valBAddrMeta.isInStackAddress) {
+		slotAbsoluteBase = valAAddrMeta.slotAbsoluteBase;
+		//valA = builder->getInt64(
+		//	fakeStackBase +
+		//	valASlot.metadata.slotAbsoluteBase +
+		//	valASlot.metadata.relativeOffset
+		//);
 		hasSignleVspOperand = true;
 		auto constValue = GetConstantInt(valB);
-		if (constValue) relativeOffse = *constValue;
+		if (constValue) relativeOffset = valAAddrMeta.relativeOffset + *constValue;
+		else __debugbreak();
 	}
-	else {
-		if (valA->getType()->isPointerTy()) __debugbreak();
-		if (valB->getType()->isPointerTy()) __debugbreak();
-		result = builder->CreateAdd(valA, valB, "add_res");
-	}
-
 
 	calcType = GetTypeByDepth(match.bitDepth);
 	if (match.bitDepth == BitDepth_8) {
 		valB = builder->CreateTrunc(valB, i8);
 		valA = builder->CreateTrunc(valA, i8);
 		pushDepth = BitDepth_16; // Результат 8-битного сложения всегда 16 бит
+		hasSignleVspOperand = false;
+
 	}
 
-	ShadowStackSlot resultSlot;
-	resultSlot.isInStackAddress = hasSignleVspOperand; // Если один из операндов был VSP, результат тоже помечаем как VSP
-	resultSlot.isPointerToVirtualStackSlot = vspSlot;
-	resultSlot.bitDepth = pushDepth;
-	resultSlot.value = result;
-	resultSlot.slotAbsoluteBase = slotAbsoluteBase;
-	resultSlot.relativeOffset = relativeOffse;
-	shadowStack.push_back(resultSlot);
+	if (hasSignleVspOperand && fakeStackBase + relativeOffset + slotAbsoluteBase > fakeStackBase){
+		hasSignleVspOperand = false;
+		relativeOffset = 0;
+		slotAbsoluteBase = 0;
+	}
+
+	result = builder->CreateAdd(valA, valB, "add_res");
+	if (match.bitDepth == BitDepth_8) {
+		result = builder->CreateZExt(result, i16);
+	}
+
+	StackMetadata resultMeta;
+	resultMeta.addressMeta.isInStackAddress = hasSignleVspOperand;
+	resultMeta.addressMeta.relativeOffset = relativeOffset;
+	resultMeta.addressMeta.slotAbsoluteBase = slotAbsoluteBase;
+
+	shadowStack.Push(pushDepth, result, resultMeta);
 
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = valA;
@@ -1131,13 +877,10 @@ void LLVMBasicBlockLifter::LiftVmAdd(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.res = nullptr;
 	flagsPromise.opType = calcType;
 
-	ShadowStackSlot flagsSlot;
-	flagsSlot.isInStackAddress = false; // Если один из операндов был VSP, результат тоже помечаем как VSP
-	flagsSlot.isPointerToVirtualStackSlot = nullptr;
-	flagsSlot.bitDepth = BitDepth_64;
-	flagsSlot.flagsPromise = flagsPromise;
+	StackMetadata flagsMeta;
+	flagsMeta.flagsPromise = flagsPromise;
 
-	shadowStack.push_back(flagsSlot);
+	shadowStack.Push(BitDepth_64, nullptr, flagsMeta);
 
 	if (logDebugMessage) {
 		if (result->getType()->isPointerTy()) {
@@ -1157,16 +900,8 @@ void LLVMBasicBlockLifter::LiftVmNor(bool logDebugMessage, const HandlerMatch& m
 	Type* flagsType = GetTypeByDepth(match.bitDepth);
 
 	auto popDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
-	auto valBSlot = ShadowPop(popDepth);
-	auto valASlot = ShadowPop(popDepth);
-	valB = valBSlot.value;
-	valA = valASlot.value;
-	if (valBSlot.isInStackAddress) {
-		valB = builder->getInt64(fakeStackBase + valBSlot.slotAbsoluteBase + valBSlot.relativeOffset);
-	}
-	if (valASlot.isInStackAddress) {
-		valA = builder->getInt64(fakeStackBase + valASlot.slotAbsoluteBase + valASlot.relativeOffset);
-	}
+	valB = Pop(popDepth).value;
+	valA = Pop(popDepth).value;
 
 	if (match.bitDepth == BitDepth_8) {
 		valB = builder->CreateTrunc(valB, i8);
@@ -1182,7 +917,7 @@ void LLVMBasicBlockLifter::LiftVmNor(bool logDebugMessage, const HandlerMatch& m
 	}
 
 
-	ShadowPush(result, pushDepth);
+	Push(result, pushDepth);
 	
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = valA;
@@ -1191,13 +926,10 @@ void LLVMBasicBlockLifter::LiftVmNor(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.res = nullptr;
 	flagsPromise.opType = flagsType;
 
-	ShadowStackSlot flagsSlot;
-	flagsSlot.isInStackAddress = false;
-	flagsSlot.isPointerToVirtualStackSlot = nullptr;
-	flagsSlot.bitDepth = BitDepth_64;
-	flagsSlot.flagsPromise = flagsPromise;
+	StackMetadata flagsMeta;
+	flagsMeta.flagsPromise = flagsPromise;
 
-	shadowStack.push_back(flagsSlot);
+	shadowStack.Push(BitDepth_64, nullptr, flagsMeta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogNor, {
@@ -1214,21 +946,13 @@ void LLVMBasicBlockLifter::LiftVmNand(bool logDebugMessage, const HandlerMatch& 
 	Type* flagsType = GetTypeByDepth(match.bitDepth);
 
 	auto popDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
-	auto valBSlot = ShadowPop(popDepth);
-	auto valASlot = ShadowPop(popDepth);
-	valB = valBSlot.value;
-	valA = valASlot.value;
-	if (valBSlot.isInStackAddress) {
-		valB = builder->getInt64(fakeStackBase + valBSlot.slotAbsoluteBase + valBSlot.relativeOffset);
-	}
-	if (valASlot.isInStackAddress) {
-		valA = builder->getInt64(fakeStackBase + valASlot.slotAbsoluteBase + valASlot.relativeOffset);
-	}
+	valB = Pop(popDepth).value;
+	valA = Pop(popDepth).value;
 
 	if (match.bitDepth == BitDepth_8) {
 		valB = builder->CreateTrunc(valB, i8);
 		valA = builder->CreateTrunc(valA, i8);
-		pushDepth = BitDepth_16; // Результат 8-битного NOR всегда 16 бит
+		pushDepth = BitDepth_16; // Результат 8-битного NAND всегда 16 бит
 		flagsType = i8;
 	}
 
@@ -1238,22 +962,20 @@ void LLVMBasicBlockLifter::LiftVmNand(bool logDebugMessage, const HandlerMatch& 
 		result = builder->CreateZExt(result, i16);
 	}
 
-	ShadowPush(result, pushDepth);
+
+	Push(result, pushDepth);
 
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = valA;
 	flagsPromise.op2 = valB;
-	flagsPromise.operation = FlagsPromise::NAND;
+	flagsPromise.operation = FlagsPromise::NOR;
 	flagsPromise.res = nullptr;
 	flagsPromise.opType = flagsType;
 
-	ShadowStackSlot flagsSlot;
-	flagsSlot.isInStackAddress = false;
-	flagsSlot.isPointerToVirtualStackSlot = nullptr;
-	flagsSlot.bitDepth = BitDepth_64;
-	flagsSlot.flagsPromise = flagsPromise;
+	StackMetadata flagsMeta;
+	flagsMeta.flagsPromise = flagsPromise;
 
-	shadowStack.push_back(flagsSlot);
+	shadowStack.Push(BitDepth_64, nullptr, flagsMeta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogNand, {
@@ -1269,11 +991,11 @@ void LLVMBasicBlockLifter::LiftVmShl(bool logDebugMessage, const HandlerMatch& m
 
 	// 1. Top: Val
 	auto popDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
-	Value* val = ShadowPop(popDepth).value;
+	Value* val = Pop(popDepth).value;
 	Type* opType = GetTypeByDepth(popDepth);
 
 	// 2. Next: Amt (всегда 16 бит в стеке, но эффективно 8 бит)
-	Value* amt16 = ShadowPop(BitDepth_16).value;
+	Value* amt16 = Pop(BitDepth_16).value;
 	Value* amt8 = builder->CreateTrunc(amt16, i8);
 	Value* amt = builder->CreateZExt(amt8, opType); // Приводим к типу значения для сдвига
 
@@ -1282,7 +1004,7 @@ void LLVMBasicBlockLifter::LiftVmShl(bool logDebugMessage, const HandlerMatch& m
 
 	auto pushDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
 
-	ShadowPush(result, pushDepth);
+	Push(result, pushDepth);
 	
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = val;
@@ -1291,13 +1013,9 @@ void LLVMBasicBlockLifter::LiftVmShl(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
 
-	ShadowStackSlot flagsSlot;
-	flagsSlot.isInStackAddress = false;
-	flagsSlot.isPointerToVirtualStackSlot = nullptr;
-	flagsSlot.bitDepth = BitDepth_64;
-	flagsSlot.flagsPromise = flagsPromise;
-
-	shadowStack.push_back(flagsSlot);
+	StackMetadata meta;
+	meta.flagsPromise = flagsPromise;
+	shadowStack.Push(BitDepth_64, nullptr, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShl, {
@@ -1312,11 +1030,11 @@ void LLVMBasicBlockLifter::LiftVmShr(bool logDebugMessage, const HandlerMatch& m
 
 	// 1. Top: Val
 	auto popDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
-	Value* val = ShadowPop(popDepth).value;
+	Value* val = Pop(popDepth).value;
 	Type* opType = GetTypeByDepth(popDepth);
 
 	// 2. Next: Amt (всегда 16 бит в стеке, но эффективно 8 бит)
-	Value* amt16 = ShadowPop(BitDepth_16).value;
+	Value* amt16 = Pop(BitDepth_16).value;
 	Value* amt8 = builder->CreateTrunc(amt16, i8);
 	Value* amt = builder->CreateZExt(amt8, opType); // Приводим к типу значения для сдвига
 
@@ -1325,7 +1043,7 @@ void LLVMBasicBlockLifter::LiftVmShr(bool logDebugMessage, const HandlerMatch& m
 
 	auto pushDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
 
-	ShadowPush(result, pushDepth);
+	Push(result, pushDepth);
 
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = val;
@@ -1334,13 +1052,10 @@ void LLVMBasicBlockLifter::LiftVmShr(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
 
-	ShadowStackSlot flagsSlot;
-	flagsSlot.isInStackAddress = false;
-	flagsSlot.isPointerToVirtualStackSlot = nullptr;
-	flagsSlot.bitDepth = BitDepth_64;
-	flagsSlot.flagsPromise = flagsPromise;
+	StackMetadata meta;
+	meta.flagsPromise = flagsPromise;
 
-	shadowStack.push_back(flagsSlot);
+	shadowStack.Push(BitDepth_64, nullptr, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShl, {
@@ -1356,15 +1071,15 @@ void LLVMBasicBlockLifter::LiftVmShld(bool logDebugMessage, const HandlerMatch& 
 
 	// Stack: Dst, Src, Count
 	auto popDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
-	llvm::Value* dst = ShadowPop(popDepth).value;
+	llvm::Value* dst = Pop(popDepth).value;
 	if (match.bitDepth == BitDepth_8) {
 		dst = builder->CreateTrunc(dst, i8);
 	}
-	llvm::Value* src = ShadowPop(popDepth).value;
+	llvm::Value* src = Pop(popDepth).value;
 	if (match.bitDepth == BitDepth_8) {
 		src = builder->CreateTrunc(src, i8);
 	}
-	llvm::Value* count16 = ShadowPop(BitDepth_16).value;
+	llvm::Value* count16 = Pop(BitDepth_16).value;
 	llvm::Value* count8 = builder->CreateTrunc(count16, i8);
 	llvm::Value* count = builder->CreateZExt(count8, dst->getType());
 
@@ -1380,7 +1095,7 @@ void LLVMBasicBlockLifter::LiftVmShld(bool logDebugMessage, const HandlerMatch& 
 	llvm::Value* result = builder->CreateCall(fshlFunc, { dst, src, count });
 
 
-	ShadowPush(result, pushDepth);
+	Push(result, pushDepth);
 	
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = dst;
@@ -1390,13 +1105,10 @@ void LLVMBasicBlockLifter::LiftVmShld(bool logDebugMessage, const HandlerMatch& 
 	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
 
-	ShadowStackSlot flagsSlot;
-	flagsSlot.isInStackAddress = false;
-	flagsSlot.isPointerToVirtualStackSlot = nullptr;
-	flagsSlot.bitDepth = BitDepth_64;
-	flagsSlot.flagsPromise = flagsPromise;
+	StackMetadata meta;
+	meta.flagsPromise = flagsPromise;
 
-	shadowStack.push_back(flagsSlot);
+	shadowStack.Push(BitDepth_64, nullptr, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShld, {
@@ -1412,15 +1124,15 @@ void LLVMBasicBlockLifter::LiftVmShrd(bool logDebugMessage, const HandlerMatch& 
 
 	// Stack: Dst, Src, Count
 	auto popDepth = (match.bitDepth == BitDepth_8) ? BitDepth_16 : match.bitDepth;
-	llvm::Value* dst = ShadowPop(popDepth).value;
+	llvm::Value* dst = Pop(popDepth).value;
 	if (match.bitDepth == BitDepth_8) {
 		dst = builder->CreateTrunc(dst, i8);
 	}
-	llvm::Value* src = ShadowPop(popDepth).value;
+	llvm::Value* src = Pop(popDepth).value;
 	if (match.bitDepth == BitDepth_8) {
 		src = builder->CreateTrunc(src, i8);
 	}
-	llvm::Value* count16 = ShadowPop(BitDepth_16).value;
+	llvm::Value* count16 = Pop(BitDepth_16).value;
 	llvm::Value* count8 = builder->CreateTrunc(count16, i8);
 	llvm::Value* count = builder->CreateZExt(count8, dst->getType());
 
@@ -1438,7 +1150,7 @@ void LLVMBasicBlockLifter::LiftVmShrd(bool logDebugMessage, const HandlerMatch& 
 	llvm::Value* result = builder->CreateCall(fshrFunc, { src, dst, count });
 
 
-	ShadowPush(result, pushDepth);
+	Push(result, pushDepth);
 	
 	FlagsPromise flagsPromise;
 	flagsPromise.op1 = dst;
@@ -1448,13 +1160,10 @@ void LLVMBasicBlockLifter::LiftVmShrd(bool logDebugMessage, const HandlerMatch& 
 	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
 
-	ShadowStackSlot flagsSlot;
-	flagsSlot.isInStackAddress = false;
-	flagsSlot.isPointerToVirtualStackSlot = nullptr;
-	flagsSlot.bitDepth = BitDepth_64;
-	flagsSlot.flagsPromise = flagsPromise;
+	StackMetadata meta;
+	meta.flagsPromise = flagsPromise;
 
-	shadowStack.push_back(flagsSlot);
+	shadowStack.Push(BitDepth_64, nullptr, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShrd, {
@@ -1466,216 +1175,25 @@ void LLVMBasicBlockLifter::LiftVmShrd(bool logDebugMessage, const HandlerMatch& 
 	}
 }
 
-std::pair<int, int64_t> LLVMBasicBlockLifter::FindSlotByOffset(ShadowStackSlot* startSlot, int64_t offset) {
-	if (shadowStack.empty()) return { -1, 0 };
-	if (offset < 0) { __debugbreak(); return { -1, 0 }; }
-
-	// 1. Находим индекс стартового слота
-	// Так как это deque, память не непрерывная, адресная арифметика не сработает.
-	// Приходится искать перебором. Оптимизация: ищем с конца, так как работаем с верхушкой.
-	int startPoint = -1;
-	for (int i = shadowStack.size() - 1; i >= 0; --i) {
-		if (&shadowStack[i] == startSlot) {
-			startPoint = i;
-			break;
-		}
-	}
-
-	if (startPoint == -1) return { -1, 0 };
-	if (offset == 0) return { startPoint, 0 };
-
-	// 2. Сканируем "вглубь" стека (в сторону уменьшения индексов)
-	int64_t currentScannedOffset = 0;
-
-	// ЦИКЛ ИДЕТ ВНИЗ (--i), так как offset увеличивает адрес (к старым элементам)
-	for (int i = startPoint; i >= 0; --i) {
-		auto& slot = shadowStack[i];
-
-		int64_t slotSize = (slot.bitDepth == BitDepth_8) ? 1 : (slot.bitDepth / 8);
-
-		// Диапазон: [current, current + size)
-		if (offset < (currentScannedOffset + slotSize)) {
-			// Нашли!
-			int64_t offsetInThisSlot = offset - currentScannedOffset;
-			return { i, offsetInThisSlot };
-		}
-
-		currentScannedOffset += slotSize;
-	}
-
-	// Уперлись в дно стека (индекс < 0)
-	return { -1, 0 };
-}
-
-bool LLVMBasicBlockLifter::TryGenerateShadowStackAccess(
-	ShadowStackPop* targetAddr,
-	HandlerBitDepth dataType,
-	llvm::Value* valueToWrite
-) {
-	auto slotInfo = FindSlotByOffset(
-		targetAddr->isPointerToVirtualStackSlot, 
-		targetAddr->relativeOffset
-	);
-	if (slotInfo.first == -1) { return false; }
-
-	int currentIndex = slotInfo.first;
-	int64_t currentOffsetInSlot = slotInfo.second;
-
-	uint64_t totalBytes = dataType / 8;
-	if (totalBytes == 0) return false;
-
-	// =========================================================
-	// ВЕТКА ЗАПИСИ (WRITE)
-	// =========================================================
-	if (valueToWrite != nullptr) {
-		uint64_t bytesWritten = 0;
-
-		// Приведение типов (Ptr -> Int, Bitcast)
-		llvm::Value* sourceInt = valueToWrite;
-
-		while (bytesWritten < totalBytes) {
-			// ПРОВЕРКА: Если индекс ушел в минус, мы вышли за дно стека
-			if (currentIndex < 0) {
-				__debugbreak(); // Stack Underflow / Access Violation
-				return false;
-			}
-
-			ShadowStackSlot& slot = shadowStack[currentIndex];
-
-			uint64_t slotSize = slot.bitDepth / 8;
-			uint64_t bytesAvailableInSlot = slotSize - currentOffsetInSlot;
-			uint64_t bytesRemaining = totalBytes - bytesWritten;
-			uint64_t bytesToProcess = std::min(bytesAvailableInSlot, bytesRemaining);
-
-			// --- Подготовка значения слота ---
-			llvm::Value* slotVal = slot.value;
-			if (slotVal->getType()->isPointerTy()) {
-				slotVal = builder->CreatePtrToInt(slotVal, builder->getInt64Ty(), "slot_ptr2int");
-				slot.isInStackAddress = false;
-				slot.isPointerToVirtualStackSlot = nullptr;
-			}
-			else if (slotVal->getType()->getIntegerBitWidth() < 64) {
-				slotVal = builder->CreateZExt(slotVal, builder->getInt64Ty(), "slot_zext");
-			}
-
-			// --- 1. Подготовка куска (Chunk) ---
-			llvm::Value* chunk = sourceInt;
-			if (bytesWritten > 0) {
-				chunk = builder->CreateLShr(chunk, bytesWritten * 8, "write_chunk_shr");
-			}
-			chunk = builder->CreateTrunc(chunk, i64, "write_chunk_trunc");
-
-			uint64_t chunkMaskVal = (bytesToProcess == 8) ? -1ULL : ((1ULL << (bytesToProcess * 8)) - 1);
-			chunk = builder->CreateAnd(chunk, builder->getInt64(chunkMaskVal));
-
-			// --- 2. Очистка (RMW) ---
-			llvm::APInt maskAPI(64, chunkMaskVal);
-			maskAPI = maskAPI.shl(currentOffsetInSlot * 8);
-			llvm::Value* clearMask = builder->getIntN(64, ~maskAPI.getZExtValue());
-
-			slotVal = builder->CreateAnd(slotVal, clearMask, "slot_clear");
-
-			// --- 3. Вставка ---
-			llvm::Value* shiftedChunk = builder->CreateShl(chunk, currentOffsetInSlot * 8, "chunk_shl");
-			slotVal = builder->CreateOr(slotVal, shiftedChunk, "slot_update");
-
-			// --- 4. Сохранение ---
-			if (slot.bitDepth != BitDepth_64) {
-				slot.value = builder->CreateTrunc(slotVal, GetTypeByDepth((HandlerBitDepth)slot.bitDepth), "slot_restore");
-			}
-			else {
-				slot.value = slotVal;
-			}
-
-			// --- ОБНОВЛЕНИЕ ИТЕРАТОРОВ (ИДЕМ ВНИЗ) ---
-			bytesWritten += bytesToProcess;
-			currentOffsetInSlot = 0;
-			currentIndex--; // <--- ДВИЖЕНИЕ К ИНДЕКСУ 0 (старые записи, след. адрес памяти)
-		}
-
-		return true;
-	}
-	// =========================================================
-	// ВЕТКА ЧТЕНИЯ (READ)
-	// =========================================================
-	else {
-		uint64_t bytesRead = 0;
-		llvm::Type* accumulatorType = GetTypeByDepth(dataType);
-		llvm::Value* resultAcc = CreateValueByDepth(dataType, 0);
-
-		while (bytesRead < totalBytes) {
-			// ПРОВЕРКА: Выход за дно стека
-			if (currentIndex < 0) {
-				__debugbreak();
-				return false;
-			}
-
-			ShadowStackSlot& slot = shadowStack[currentIndex];
-			uint64_t slotSize = (slot.bitDepth == BitDepth_8) ? 1 : (slot.bitDepth / 8);
-			uint64_t bytesAvailableInSlot = slotSize - currentOffsetInSlot;
-			uint64_t bytesRemaining = totalBytes - bytesRead;
-			uint64_t bytesToProcess = std::min(bytesAvailableInSlot, bytesRemaining);
-
-			// --- 1. Извлечение ---
-			llvm::Value* slotVal = slot.value;
-			if (slotVal->getType()->isPointerTy()) {
-				slotVal = builder->CreatePtrToInt(slotVal, builder->getInt64Ty(), "read_ptr2int");
-			}
-			else if (slotVal->getType()->getIntegerBitWidth() < 64) {
-				slotVal = builder->CreateZExt(slotVal, builder->getInt64Ty(), "read_zext");
-			}
-
-			// --- 2. Сдвиг и обрезка ---
-			if (currentOffsetInSlot > 0) {
-				slotVal = builder->CreateLShr(slotVal, currentOffsetInSlot * 8, "read_shr");
-			}
-			llvm::Value* chunk = builder->CreateTrunc(slotVal, builder->getIntNTy(bytesToProcess * 8), "read_trunc");
-
-			// --- 3. Вставка в аккумулятор ---
-			llvm::Value* chunkExt = builder->CreateZExt(chunk, accumulatorType, "read_ext");
-			if (bytesRead > 0) {
-				chunkExt = builder->CreateShl(chunkExt, bytesRead * 8, "read_shl");
-			}
-			resultAcc = builder->CreateOr(resultAcc, chunkExt, "read_or");
-
-			// --- ОБНОВЛЕНИЕ ИТЕРАТОРОВ (ИДЕМ ВНИЗ) ---
-			bytesRead += bytesToProcess;
-			currentOffsetInSlot = 0;
-			currentIndex--; // <--- ДВИЖЕНИЕ К ИНДЕКСУ 0
-		}
-
-		// PUSH результата
-		HandlerBitDepth resDepth = BitDepth_64;
-		if (totalBytes == 1) resDepth = BitDepth_16;
-		else if (totalBytes == 2) resDepth = BitDepth_16;
-		else if (totalBytes == 4) resDepth = BitDepth_32;
-
-		ShadowPush(resultAcc, resDepth);
-		return true;
-	}
-
-	return false;
-}
 
 void LLVMBasicBlockLifter::GenerateStackMemoryAccess(
 	llvm::Value* targetAddr,
+	llvm::Value* realStackAddr,
 	llvm::Type* dataType,
 	llvm::Value* valueToWrite, // Если nullptr, то это READ
 	bool useHooks
 ) {
-	if (!targetAddr->getType()->isPointerTy()) {
-		__debugbreak(); // Ожидаем указатель на стек
-		assert(false && "Expected pointer type for stack access");
-	}
 	auto* typedPtr = builder->CreateBitCast(targetAddr, dataType->getPointerTo(), "vsp_base_typed");
 	if (valueToWrite) { // WRITE
+		auto* typedRealPtr = builder->CreateBitCast(realStackAddr, dataType->getPointerTo(), "real_stack_ptr_typed");
 		builder->CreateStore(valueToWrite, typedPtr);
+		builder->CreateStore(valueToWrite, typedRealPtr);
 	}
 	else { // READ
 		llvm::Value* loadedStackVal = builder->CreateLoad(dataType, typedPtr, "stack_load");
 		auto bitWidth = dataType->getIntegerBitWidth();
 		auto pushDepth = (bitWidth == 8) ? BitDepth_16 : static_cast<HandlerBitDepth>(bitWidth);
-		ShadowPush(loadedStackVal, pushDepth);
+		Push(loadedStackVal, pushDepth);
 	}
 }
 void LLVMBasicBlockLifter::GenerateRamMemoryAccess(
@@ -1723,12 +1241,13 @@ void LLVMBasicBlockLifter::GenerateRamMemoryAccess(
 	if (loadedRamVal) {
 		unsigned bitWidth = dataType->getIntegerBitWidth();
 		if (bitWidth == 8) bitWidth = 16; // Правило для 8 бит: расширяем до 16 при чтении из RAM
-		ShadowPush(loadedRamVal, static_cast<HandlerBitDepth>(bitWidth));
+		Push(loadedRamVal, (HandlerBitDepth)bitWidth);
 	}
 
 }
 void LLVMBasicBlockLifter::GenerateMemoryAccess(
 	llvm::Value* targetAddr,
+	llvm::Value* realStackAddr,
 	llvm::Type* dataType,
 	llvm::Value* valueToWrite, // Если nullptr, то это READ
 	bool useHooks,
@@ -1736,10 +1255,16 @@ void LLVMBasicBlockLifter::GenerateMemoryAccess(
 {
 	
 	using namespace llvm;
-	//FlushVsp(true);
 
 	if (isProvenStackAddress) {
-		GenerateStackMemoryAccess(targetAddr, dataType, valueToWrite, useHooks);
+		FlushVsp(true, true);
+		GenerateStackMemoryAccess(
+			targetAddr, 
+			realStackAddr, 
+			dataType, 
+			valueToWrite,
+			useHooks
+		);
 		return;
 	}
 
@@ -1751,8 +1276,8 @@ void LLVMBasicBlockLifter::GenerateMemoryAccess(
 
 void LLVMBasicBlockLifter::LiftVmEntry(const VmEntryHandlerData& data) {
 	// 1. Пушим заглушки (как в оригинале VMP)
-	ShadowPush(builder->getInt64(0), BitDepth_64);
-	ShadowPush(builder->getInt64(0), BitDepth_64);
+	Push(builder->getInt64(0), BitDepth_64);
+	Push(builder->getInt64(0), BitDepth_64);
 
 	// 2. Пушим регистры из NativeContext в виртуальный стек
 	// data.popedRegsOrder содержит порядок, в котором VMP ожидает регистры в стеке
@@ -1773,14 +1298,14 @@ void LLVMBasicBlockLifter::LiftVmEntry(const VmEntryHandlerData& data) {
 
 		llvm::Value* regVal = builder->CreateLoad(i64, regPtr, "reg_val");
 
-		ShadowPush(regVal, BitDepth_64);
+		Push(regVal, BitDepth_64);
 	}
 
 	// 3. Пушим ImageBaseDifference (аргумент функции)
-	ShadowPush(builder->getInt64(0), BitDepth_64);
+	Push(imageBaseDif, BitDepth_64);
 }
 void LLVMBasicBlockLifter::LiftVmJmpIndirect(bool logDebugMessage, const VmJmpData& jmpData) {
-	llvm::Value* rawAddr = ShadowPop(BitDepth_64).value;
+	llvm::Value* rawAddr = Pop(BitDepth_64).value;
 	//auto* targetAddr = builder->CreateAdd(
 	//	rawAddr,
 	//	builder->getInt64(jmpData.newVipShift),
@@ -1788,7 +1313,7 @@ void LLVMBasicBlockLifter::LiftVmJmpIndirect(bool logDebugMessage, const VmJmpDa
 
 	auto* targetAddr = rawAddr;
 
-	std::cout << "ShadowStack size before JMP: " << shadowStack.size() << std::endl;
+	std::cout << "ShadowStack size before JMP: " << shadowStack.Size() << std::endl;
 
 	// 2. Логирование
 	builder->CreateCall(jitLogJmpIndirect, { targetAddr });
@@ -1796,14 +1321,35 @@ void LLVMBasicBlockLifter::LiftVmJmpIndirect(bool logDebugMessage, const VmJmpDa
 	// 3. Пишем адрес в аллоку targetVip, чтобы диспетчер его увидел
 	builder->CreateStore(targetAddr, targetVip);
 
-	// 4. Сбрасываем теневой стек в память, так как переходим в другой блок
-	FlushVsp(true);
+	
+	auto* realStackI8 = builder->CreateBitCast(
+		realStackPtr,
+		i8->getPointerTo()
+	);
 
+	int index = 0;
+	int64_t tempOffset = realStackOffset;
+	for (auto& slot : shadowStack) {
+		if (index >= shadowStack.Size() - 19) break;
+		tempOffset -= slot.bitDepth;
+		auto* realStackGep = builder->CreateConstGEP1_64(
+			i8,
+			realStackI8,
+			tempOffset
+		);
+		auto* typedStackGep = builder->CreateBitCast(realStackGep, i64->getPointerTo());
+		builder->CreateStore(builder->getInt64(0), typedStackGep);
+	}
+
+	// 5. Сбрасываем теневой стек в память, так как переходим в другой блок
+	FlushVsp(true, false);
 }
 void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& data) {
+	std::cout << "ShadowStack size before Exit: " << shadowStack.Size() << std::endl;
+
 	// 1. Выгружаем регистры из виртуального стека обратно в NativeContext
 	for (auto& reg : data.popedRegsOrder) {
-		auto slot = ShadowPop(BitDepth_64);
+		auto slot = Pop(BitDepth_64);
 		auto* value = slot.value;
 
 		int64_t index = GetNativeOffset(reg.id);
@@ -1817,16 +1363,13 @@ void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& da
 			"native_reg_" + reg.name
 		);
 
-		if (!slot.isInStackAddress) 
-			builder->CreateStore(value, regPtr);
-		else 
-			builder->CreateStore(builder->getInt64(slot.slotAbsoluteBase + slot.relativeOffset), regPtr);
+		builder->CreateStore(value, regPtr);
 	}
 
 	// 2. Выгружаем адрес выхода (VmExitAddr)
 	// Обычно VMP хранит его в одном из слотов контекста (например, вместо одного из регистров или в спец. поле)
 	{
-		auto* value = ShadowPop(BitDepth_64).value;
+		auto* value = Pop(BitDepth_64).value;
 
 		// vmExitAddr - это индекс в структуре (int)
 		llvm::Value* regPtr = builder->CreateStructGEP(
@@ -1840,7 +1383,7 @@ void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& da
 
 	// 3. Выгружаем адрес возврата (RetAddr)
 	{
-		auto* value = ShadowPop(BitDepth_64).value;
+		auto* value = Pop(BitDepth_64).value;
 
 		// retAddrOffset - это индекс в структуре (int)
 		llvm::Value* regPtr = builder->CreateStructGEP(
@@ -1854,6 +1397,26 @@ void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& da
 
 	// 4. Сигнализируем Диспетчеру (TraceLifter), что нужно остановиться.
 	// Запись 0 в targetVip приведет к выходу из switch-цикла диспетчера.
-	builder->CreateStore(builder->getInt64(0), targetVip, true);
+	builder->CreateStore(builder->getInt64(0), targetVip);
 
+	//if (shadowStack.Size() > 0) {
+	//	FlushVsp(true, );
+
+	//	auto* realStackI8 = builder->CreateBitCast(
+	//		realStackPtr,
+	//		i8->getPointerTo()
+	//	);
+
+	//	for (int i = 0; i < 18; ++i) {
+	//		auto* realStackGep = builder->CreateConstGEP1_64(
+	//			i8,
+	//			realStackI8,
+	//			realStackOffset + i * 8
+	//		);
+	//		auto* typedStackGep = builder->CreateBitCast(realStackGep, i64->getPointerTo());
+	//		builder->CreateStore(builder->getInt64(0), typedStackGep);
+	//	}
+	//}
+
+	
 }

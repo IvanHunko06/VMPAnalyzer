@@ -136,7 +136,7 @@ HandlerMatch MatchVmHandler(const HandlerEmulationData& data);
 struct VirtualBasicBlock {
 	uint64_t startAddr{ 0 };
 	int64_t nextVipShift{ 0 };
-	int64_t stackOffset{ 0 };
+	int64_t virtualStackOffset{ 0 };
 	std::vector<HandlerMatch> instructions;
 };
 

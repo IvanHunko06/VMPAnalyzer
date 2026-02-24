@@ -67,7 +67,7 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 	// јллокации переменных
 	//llvm::Type* vmStackType = llvm::ArrayType::get(i8, 4096);
 	auto* vsp = llvmIrBuilder->CreateAlloca(i8, llvmIrBuilder->getInt32(4096), "vsp_array");
-	llvmIrBuilder->CreateMemSet(vsp, llvmIrBuilder->getInt8(0), 4096, llvm::MaybeAlign(1));
+	//llvmIrBuilder->CreateMemSet(vsp, llvmIrBuilder->getInt8(0), 4096, llvm::MaybeAlign(1));
 
 	auto* vsp_ptr = llvmIrBuilder->CreateConstInBoundsGEP1_32(
 		i8,
@@ -84,6 +84,8 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 		);
 	}
 
+	auto* virtualContext = llvmIrBuilder->CreateAlloca(i8, llvmIrBuilder->getInt32(256), "virtual_ctx");
+
 	// --- Dispatcher Block ---
 	llvmIrBuilder->SetInsertPoint(dispatchBlock);
 	Value* currentVip = llvmIrBuilder->CreateLoad(i64, targetVip, "current_vip");
@@ -91,19 +93,23 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 
 	dispatchSwitch->addCase(llvmIrBuilder->getInt64(0), exitBlock);
 
+	BasicBlockLifterConstructor constr;
+	constr.context = llvmContext.get();
+	constr.llvmModule = llvmModule.get();
+	constr.builder = llvmIrBuilder.get();
+	constr.function = function;
+	constr.vsp_ptr = vsp_ptr;
+	constr.vspBasePtr = vsp;
+	constr.nativeContext = nativeContextPtr;
+	constr.nativeContextType = nativeContextType;
+	constr.virtualContext = virtualContext;
+	constr.imageBaseDif = imageBaseDif;
+	constr.targetVip = targetVip;
+	constr.realStackPtr = realStackPtr;
+
+
 	// --- Init Lifter ---
-	basicBlockLifter = std::make_unique<LLVMBasicBlockLifter>(
-		llvmContext.get(),
-		llvmModule.get(),
-		llvmIrBuilder.get(),
-		function,
-		vsp_ptr, // передаем аллоку указател€
-		vsp,     // передаем базу стека
-		nativeContextPtr,
-		nativeContextType,
-		imageBaseDif,
-		targetVip
-	);
+	basicBlockLifter = std::make_unique<LLVMBasicBlockLifter>(constr);
 
 	std::map<uint64_t, VirtualBasicBlock*> vipToBlockMap;
 	std::vector<uint64_t> vipsOrder;
@@ -136,14 +142,30 @@ void LLVMTraceLifter::LiftTraceFunction(const std::vector<VirtualBasicBlock> bas
 		// 3. ¬ конце блока (если там еще нет терминатора) прыгаем обратно в диспетчер
 		// ѕримечание: VM_EXIT и JMP_INDIRECT сами управл€ют потоком, но
 		// структурно блок должен заканчиватьс€ переходом.
-		llvm::BasicBlock* currentTailBlock = llvmIrBuilder->GetInsertBlock();
-		if (!currentTailBlock->getTerminator()) {
-			//currentVip = llvmIrBuilder->CreateLoad(i64, targetVip, "current_vip");
-			llvmIrBuilder->CreateBr(dispatchBlock);
-		}
+		//llvm::BasicBlock* currentTailBlock = llvmIrBuilder->GetInsertBlock();
+		//if (!currentTailBlock->getTerminator()) {
+		//	//currentVip = llvmIrBuilder->CreateLoad(i64, targetVip, "current_vip");
+		//	llvmIrBuilder->CreateBr(dispatchBlock);
+		//}
 
 		PrintBasicBlock(bb);
 	}
+
+	for (int i = 0; i < vipsOrder.size() - 1; ++i) {
+		auto* bb = virtualBasicBlockMap[vipsOrder[i]];
+		if (bb == nullptr) continue;
+
+		llvmIrBuilder->SetInsertPoint(bb);
+
+		if (!bb->getTerminator()) {
+			auto* nextBlock = virtualBasicBlockMap[vipsOrder[i + 1]];
+			llvmIrBuilder->CreateBr(nextBlock);
+		}
+	}
+
+	auto* lastBlock = virtualBasicBlockMap[vipsOrder[vipsOrder.size() - 1]];
+	llvmIrBuilder->SetInsertPoint(lastBlock);
+	llvmIrBuilder->CreateBr(exitBlock);
 
 	if (protectedCodeEntryBlock) {
 		llvmIrBuilder->SetInsertPoint(entryBasicBlock);

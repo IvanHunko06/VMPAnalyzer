@@ -221,7 +221,7 @@ int main() {
 	LLVMTraceLifter lifter(virtualBlocks);
 	//lifter.OptimizeModule(true);
 	//lifter.PrintModule();
-	CFGRepatcher::Patch(lifter);
+	//CFGRepatcher::Patch(lifter);
 	lifter.OptimizeModule(true);
 	lifter.PrintModule();
 	

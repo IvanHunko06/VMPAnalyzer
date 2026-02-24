@@ -1063,7 +1063,7 @@ std::vector<VirtualBasicBlock> SplitToVirtualBlocks(const std::vector<HandlerMat
 		currentBlock.instructions.push_back(instr);
 		if (currentBlock.instructions.size() == 1) {
 			currentBlock.startAddr = instr.vipBefore;
-			currentBlock.stackOffset = currentStackOffset;
+			currentBlock.virtualStackOffset = currentStackOffset;
 		}
 		currentStackOffset += instr.vspAfter - instr.vspBefore;
 		
