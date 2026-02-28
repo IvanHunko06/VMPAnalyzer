@@ -249,7 +249,7 @@ void LLVMFunctionLifter::FlushVspToMemory() {
 void LLVMFunctionLifter::LiftVmEntry(const VmEntryHandlerData& data) {
 	Push(builder->getInt64(0), BitDepth_64);
 	Push(builder->getInt64(0), BitDepth_64);
-	for (auto& reg : data.popedRegsOrder) {
+	for (auto& reg : data.pushRegsOrder) {
 		int64_t index = GetNativeOffset(reg.id);
 
 		if (index == -1) continue;
@@ -269,7 +269,7 @@ void LLVMFunctionLifter::LiftVmEntry(const VmEntryHandlerData& data) {
 }
 
 void LLVMFunctionLifter::LiftVmPop(const HandlerMatch& match) {
-	auto& data = std::get<VmPopRegData>(match.matchData);
+	auto& data = std::get<VmContextAccessData>(match.matchData);
 	
 	llvm::Value* valueToStore = nullptr;
 	llvm::Type* storeType = nullptr;
@@ -321,7 +321,7 @@ void LLVMFunctionLifter::LiftVmPop(const HandlerMatch& match) {
 	builder->CreateStore(valueToStore, destPtrTyped);
 }
 void LLVMFunctionLifter::LiftVmPushReg(const HandlerMatch& match) {
-	auto& data = std::get<VmPushRegData>(match.matchData);
+	auto& data = std::get<VmContextAccessData>(match.matchData);
 	
 	llvm::Type* loadType = (match.bitDepth == BitDepth_8) ? builder->getInt8Ty() : GetTypeByDepth(match.bitDepth);
 
@@ -333,8 +333,8 @@ void LLVMFunctionLifter::LiftVmPushReg(const HandlerMatch& match) {
 	llvm::Value* regPtrI8 = builder->CreateConstInBoundsGEP1_32(
 		llvm::Type::getInt8Ty(*ctx), // Шагаем по байтам
 		ctxBaseI8,                  // База
-		data.regOffset,           // Смещение (например, 0x00 для RAX)
-		"push_reg_offset_" + std::to_string(data.regOffset)
+		data.offset,           // Смещение (например, 0x00 для RAX)
+		"push_reg_offset_" + std::to_string(data.offset)
 	);
 
 	llvm::Value* typedRegPtr = builder->CreateBitCast(
@@ -357,7 +357,7 @@ void LLVMFunctionLifter::LiftVmPushReg(const HandlerMatch& match) {
 
 		builder->CreateCall(jitLogPushReg, {
 			builder->getInt32(match.bitDepth),
-			builder->getInt64(data.regOffset),
+			builder->getInt64(data.offset),
 			val64
 			});
 	}
@@ -1092,7 +1092,6 @@ void LLVMFunctionLifter::LiftVirtualCode(const std::string& functionName, const 
 			stopLifting = true;
 			break;
 		case Handler_VmJmpIndirect:
-		case Handler_VmJmpIndirectRemap:
 			LiftVmJmpIndirect(std::get<VmJmpData>(handler.matchData));
 			stopLifting = true;
 			break;

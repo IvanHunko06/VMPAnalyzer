@@ -108,7 +108,7 @@ void PrintNativeContext(const NativeContext& context) {
 
 void RunEmulation(VmJitRunner& runner, const VmEntryHandlerData& vmEntryData, const std::map<uint64_t, std::string> virtualAddrToFunctionMap) {
 	NativeContext context;
-	for (auto& reg : vmEntryData.popedRegsOrder) {
+	for (auto& reg : vmEntryData.pushRegsOrder) {
 		auto offset = GetNativeOffset(reg.id);
 		if (offset == -1) continue;
 		uint64_t* contexti64Ptr = reinterpret_cast<uint64_t*>(&context);
@@ -189,8 +189,7 @@ void EmulateVmCode(const std::vector<HandlerMatch>& handlers) {
 	for (int i = 0; i < virtualBlocks.size(); ++i) {
 		auto& block = virtualBlocks[i];
 		auto& lastInstr = block.instructions.back();
-		if (lastInstr.type == Handler_VmJmpIndirect ||
-			lastInstr.type == Handler_VmJmpIndirectRemap) {
+		if (lastInstr.type == Handler_VmJmpIndirect) {
 			auto jmpData = std::get<VmJmpData>(lastInstr.matchData);
 			handlerFunctionNames[jmpData.newVip] = "ProtectedFunction_" + std::to_string(i + 1);
 		}

@@ -1,4 +1,4 @@
-#include "VmBasicBlock.hpp"
+#include "VmHandlerTrace.hpp"
 #include "triton/context.hpp"
 #include "triton/x8664Cpu.hpp"
 
@@ -20,10 +20,10 @@ bool IsNewHandlerTransfer(const triton::arch::Instruction& inst) {
 	return false;
 }
 
-std::vector<VmBasicBlock> ParseVmBasicBlocks(std::fstream& traceFile) {
+std::vector<VmHandlerTrace> ParseVmHandlerTraces(std::fstream& traceFile) {
 	triton::Context tempContext(triton::arch::architecture_e::ARCH_X86_64);
-	std::vector<VmBasicBlock> basicBlocks;
-	VmBasicBlock currentBlock;
+	std::vector<VmHandlerTrace> basicBlocks;
+	VmHandlerTrace currentBlock;
 	
 	
 	std::string memoryRead;
@@ -48,14 +48,14 @@ std::vector<VmBasicBlock> ParseVmBasicBlocks(std::fstream& traceFile) {
 		currentBlock.instructions.push_back(std::move(instr));
 		if (transferToNewHandler) {
 			basicBlocks.push_back(std::move(currentBlock));
-			currentBlock = VmBasicBlock();
+			currentBlock = VmHandlerTrace();
 		}
 	}
 
 	return basicBlocks;
 }
 
-void PrintBasicBlock(const VmBasicBlock& block) {
+void PrintBasicBlock(const VmHandlerTrace& block) {
 	for (auto& inst : block.instructions) {
 		std::cout << inst.instruction << '\n';
 	}

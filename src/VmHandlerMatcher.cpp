@@ -1,6 +1,8 @@
 #include "VmHandlerMatcher.hpp"
-#include <optional>
 #include "triton/x8664Cpu.hpp"
+#include <optional>
+#include <iomanip>
+
 bool IsVariable(const triton::ast::SharedAbstractNode& node, const std::string& name) {
 	if (node->getType() == triton::ast::VARIABLE_NODE) {
 		auto* variableNode = reinterpret_cast<triton::ast::VariableNode*>(node.get());
@@ -190,7 +192,7 @@ std::optional<HandlerMatch> TryMatchVmEntry(const HandlerEmulationData& data) {
 			continue;
 		}
 		
-		VmEntryHandlerData::PopedRegData pushedReg;
+		NativeRegData pushedReg;
 		if (instruction->getType() == triton::arch::x86::ID_INS_PUSHFQ) {
 			pushedReg.id = triton::arch::register_e::ID_REG_X86_EFLAGS;
 			pushedReg.name = "rflags";
@@ -203,7 +205,7 @@ std::optional<HandlerMatch> TryMatchVmEntry(const HandlerEmulationData& data) {
 			pushedReg.name = reg.getName();
 			pushedReg.value = record.concreteValue;
 		}
-		entryHandlerData.popedRegsOrder.push_back(std::move(pushedReg));
+		entryHandlerData.pushRegsOrder.push_back(std::move(pushedReg));
 	}
 
 	if (hasPrologue) pushCount += 2;
@@ -243,7 +245,7 @@ std::optional<HandlerMatch> TryMatchVmEntry(const HandlerEmulationData& data) {
 		return std::nullopt;
 	}
 
-	if (entryHandlerData.popedRegsOrder.size() < 8) {
+	if (entryHandlerData.pushRegsOrder.size() < 8) {
 		return std::nullopt;
 	}
 
@@ -270,7 +272,7 @@ std::optional<HandlerMatch> TryMatchVmPopReg(const HandlerEmulationData& data) {
 	match.vipBefore = data.vipChange.startValue;
 	match.vspBefore = data.vspChange.startValue;
 	match.vspAfter = data.vspChange.endValue;
-	VmPopRegData pushRegData;
+	VmContextAccessData pushRegData;
 	bool is8BitHandler = false;
 
 	for (auto& [addr, writeInfo] : data.logicWrites) {
@@ -286,7 +288,13 @@ std::optional<HandlerMatch> TryMatchVmPopReg(const HandlerEmulationData& data) {
 		if (pushRegData.offset > 0x100) continue;
 		pushRegData.regIndex = pushRegData.offset / writeInfo.size;
 		pushRegData.value = writeInfo.concreteValue;
+		
+		pushRegData.contextAccess.instAddr = writeInfo.instruction->GetAddress();
+		auto& operand = writeInfo.instruction->instruction->operands[0].getMemory();
+		pushRegData.contextAccess.regId = operand.getIndexRegister().getId();
+
 		match.matchData = pushRegData;
+
 		return match;
 	}
 
@@ -336,6 +344,11 @@ std::optional<HandlerMatch> TryMatchVmPushConst(const HandlerEmulationData& data
 		if (addr == data.vspChange.startValue + *vspDeltaOpt) {
 			match.bitDepth = static_cast<HandlerBitDepth>(operandSize * 8);
 			pushConstData.value = writeInfo.concreteValue;
+			
+			pushConstData.constData.instAddr = writeInfo.instruction->GetAddress();
+			auto& operand = writeInfo.instruction->instruction->operands[1].getRegister();
+			pushConstData.constData.regId = operand.getId();
+
 			match.matchData = std::move(pushConstData);
 			return match;
 		}
@@ -362,7 +375,24 @@ std::optional<HandlerMatch> TryMatchVmPushReg(const HandlerEmulationData& data) 
 	match.vipBefore = data.vipChange.startValue;
 	match.vspBefore = data.vspChange.startValue;
 	match.vspAfter = data.vspChange.endValue;
-	VmPushRegData pushRegData;
+	VmContextAccessData pushRegData;
+	bool foundRead = false;
+
+	for (auto& [addr, readInfo] : data.logicReads) {
+		auto varNode = GetUnderlyingVariable(readInfo.ast);
+		if (!varNode) continue;
+		auto variableName = GetVariableName(varNode);
+		if (!variableName) continue;
+		if (!variableName->starts_with("VmReg_")) continue;
+
+		pushRegData.contextAccess.instAddr = readInfo.instruction->GetAddress();
+		auto& operand = readInfo.instruction->instruction->operands[1].getMemory();
+		pushRegData.contextAccess.regId = operand.getIndexRegister().getId();
+		foundRead = true;
+		break;
+	}
+
+	if (!foundRead) return std::nullopt;
 
 	for (auto& [addr, writeInfo] : data.logicWrites) {
 		auto varNode = GetUnderlyingVariable(writeInfo.ast);
@@ -383,9 +413,12 @@ std::optional<HandlerMatch> TryMatchVmPushReg(const HandlerEmulationData& data) 
 			if (!foundRegRead) continue;
 			pushRegData.value = writeInfo.concreteValue;
 			auto regOffsetStr = variableName->substr(6);
-			pushRegData.regOffset = std::stoull(regOffsetStr, nullptr, 10);
-			pushRegData.regIndex = pushRegData.regOffset / writeInfo.size;
+			pushRegData.offset = std::stoull(regOffsetStr, nullptr, 10);
+			pushRegData.regIndex = pushRegData.offset / writeInfo.size;
+
 			match.matchData = std::move(pushRegData);
+
+			
 			return match;
 		}
 	}
@@ -842,40 +875,11 @@ std::optional<HandlerMatch> TryMatchVmDoubleShift(const HandlerEmulationData& da
 	return match;
 }
 
-std::optional<HandlerMatch> TryMatchVmJmpIndirect(const HandlerEmulationData& data) {
-	if (!data.vipAst || !data.vspAst) return std::nullopt;
-
-	auto vspDeltaOpt = GetAddImmediate(data.vspAst.value(), "VSP");
-	auto vipDeltaOpt = GetAddImmediate(data.vipAst.value(), "StackArg_0");
-
-	if (!vspDeltaOpt || !vipDeltaOpt) return std::nullopt;
-
-	if (std::abs(*vipDeltaOpt) != 4) return std::nullopt;
-	if (*vspDeltaOpt != 8) return std::nullopt;
-
-	HandlerMatch match;
-	match.type = Handler_VmJmpIndirect;
-	match.bitDepth = BitDepth_64;
-	match.addr = data.baseAddress;
-	match.vipBefore = data.vipChange.startValue;
-	match.vspBefore = data.vspChange.startValue;
-	match.vspAfter = data.vspChange.endValue;
-	
-	VmJmpData jmpData;
-	auto readIt = data.logicReads.find(data.vspChange.startValue);
-	if (readIt == data.logicReads.end()) return std::nullopt;
-
-	jmpData.newVip = readIt->second.concreteValue;
-	match.matchData = jmpData;
-
-	return match;
-}
-
 std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationData& data) {
 	if (!data.vipAst || !data.vspAst) return std::nullopt;
 
 	HandlerMatch match;
-	match.type = Handler_VmJmpIndirectRemap;
+	match.type = Handler_VmJmpIndirect;
 	match.bitDepth = BitDepth_64;
 	match.addr = data.baseAddress;
 	match.vipBefore = data.vipChange.startValue;
@@ -925,8 +929,13 @@ std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationDat
 	auto vipRegAst = data.registerAstMap.at(jmpData.newVipReg);
 	auto shift = GetAddImmediate(vipRegAst, "StackArg_0");
 	if (!shift) return std::nullopt;
+
+	auto& instr = readIt->second.instruction;
 	jmpData.newVip = readIt->second.concreteValue;
 	jmpData.newVipShift = *shift;
+	jmpData.jmpDestData.instAddr = instr->GetAddress();
+	auto& operand = instr->instruction->operands[0].getRegister();
+	jmpData.jmpDestData.regId = operand.getId();
 
 	auto vspRegAst = data.registerAstMap.at(jmpData.newVspReg);
 	if (!vspRegAst) return std::nullopt;
@@ -968,7 +977,7 @@ std::optional<HandlerMatch> TryMatchVmExit(const HandlerEmulationData& data) {
 			if (operand.getType() != triton::arch::OP_REG) continue;
 			auto& regOperand = operand.getRegister();
 			++actualPopCount;
-			VmExitData::PopedRegData pushedRegData;
+			NativeRegData pushedRegData;
 			pushedRegData.id = regOperand.getId();
 			pushedRegData.name = regOperand.getName();
 			pushedRegData.value = readInfo.concreteValue;
@@ -976,7 +985,7 @@ std::optional<HandlerMatch> TryMatchVmExit(const HandlerEmulationData& data) {
 		}
 		else if (instrType == triton::arch::x86::ID_INS_POPFQ) {
 			++actualPopCount;
-			VmExitData::PopedRegData pushedRegData;
+			NativeRegData pushedRegData;
 			pushedRegData.id = data.context->registers.x86_eflags.getId();
 			pushedRegData.name = data.context->registers.x86_eflags.getName();
 			pushedRegData.value = readInfo.concreteValue;
@@ -1041,9 +1050,6 @@ HandlerMatch MatchVmHandler(const HandlerEmulationData& data) {
 	auto isVmDoubleShft = TryMatchVmDoubleShift(data);
 	if (isVmDoubleShft) return *isVmDoubleShft;
 
-	//auto isVmJmpIndirect = TryMatchVmJmpIndirect(data);
-	//if (isVmJmpIndirect) return *isVmJmpIndirect;
-
 	auto isVmJmpIndirectRemap = TryMatchVmJmpIndirectRemap(data);
 	if (isVmJmpIndirectRemap) return *isVmJmpIndirectRemap;
 
@@ -1070,17 +1076,189 @@ std::vector<VirtualBasicBlock> SplitToVirtualBlocks(const std::vector<HandlerMat
 		}
 		currentStackOffset += instr.vspAfter - instr.vspBefore;
 		
-		if (instr.type == Handler_VmJmpIndirect ||
-			instr.type == Handler_VmJmpIndirectRemap) {
+		if (instr.type == Handler_VmJmpIndirect) {
 			currentBlock.nextVipShift = std::get<VmJmpData>(instr.matchData).newVipShift;
 		}
 
 		if (instr.type == Handler_VmJmpIndirect ||
-			instr.type == Handler_VmJmpIndirectRemap ||
 			instr.type == Handler_VmExit) {
 			blocks.push_back(std::move(currentBlock));
 		}
 	}
 
 	return blocks;
+}
+
+std::ostream& operator<<(std::ostream& os, const HandlerMatch& p) {
+	os << std::hex << "0x" << p.addr << ": ";
+	os << "0x" << p.vipBefore << ": " << std::dec;
+
+	if (p.type == VmHandlerType::Handler_Unknown) {
+		os << "UNKNOWN";
+	}
+	else if (p.type == VmHandlerType::Handler_VmEntry) {
+		auto matchData = std::get<VmEntryHandlerData>(p.matchData);
+		os << "VM_ENTRY { ";
+		for (auto& reg : matchData.pushRegsOrder) {
+			os << reg.name << ' ';
+		}
+		os << "} Image base dif: " << matchData.imageBaseDifference;
+	}
+	else if (p.type == VmHandlerType::Handler_VmPop) {
+		auto matchData = std::get<VmContextAccessData>(p.matchData);
+		os
+			<< "VM_POP" << p.bitDepth << "\tR" << matchData.regIndex
+			<< "\t\t Offset: 0x" << std::hex << matchData.offset <<
+			" Value: 0x" << matchData.value << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmPushConst) {
+		auto matchData = std::get<VmPushConstData>(p.matchData);
+		os
+			<< "VM_PUSH_CONST" << p.bitDepth 
+			<< std::hex << " 0x" << matchData.value 
+			<< std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmPushReg) {
+		auto matchData = std::get<VmContextAccessData>(p.matchData);
+		os
+			<< "VM_PUSH_REG" << p.bitDepth << "   R" << matchData.regIndex
+			<< "\t\t Offset: 0x" << std::hex << matchData.offset <<
+			" Value: 0x" << matchData.value << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmPushVsp) {
+		auto matchData = std::get<VmPushVspData>(p.matchData);
+		os
+			<< "VM_PUSH_VSP" << p.bitDepth 
+			<< std::hex << "\t\t\t Pushed VSP: 0x" 
+			<< matchData.value << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmPopVsp) {
+		os << "VM_POP_VSP";
+	}
+	else if (p.type == VmHandlerType::Handler_VmReadMem) {
+		auto matchData = std::get<VmMemAccessData>(p.matchData);
+		os
+			<< "VM_READ_MEM" << p.bitDepth << std::hex 
+			<< "\t\t\t [0x" << matchData.address << "]->0x" 
+			<< matchData.value << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmWriteMem) {
+		auto matchData = std::get<VmMemAccessData>(p.matchData);
+		os
+			<< "VM_WRITE_MEM" << p.bitDepth << std::hex 
+			<< "\t\t\t [0x" << matchData.address << "]=0x" 
+			<< matchData.value << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmAdd) {
+		auto matchData = std::get<VmAluData>(p.matchData);
+		os
+			<< "VM_ADD" << p.bitDepth << std::hex
+			<< "\t\t\t Arg1: 0x" << matchData.arg1
+			<< " Arg2: 0x" << matchData.arg2
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmNand) {
+		auto matchData = std::get<VmAluData>(p.matchData);
+		os
+			<< "VM_NAND" << p.bitDepth << std::hex
+			<< "\t\t\t Arg1: 0x" << matchData.arg1
+			<< " Arg2: 0x" << matchData.arg2
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmNor) {
+		auto matchData = std::get<VmAluData>(p.matchData);
+		os
+			<< "VM_NOR" << p.bitDepth << std::hex
+			<< "\t\t\t Arg1: 0x" << matchData.arg1
+			<< " Arg2: 0x" << matchData.arg2
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmRol) {
+		auto matchData = std::get<VmAluData>(p.matchData);
+		os
+			<< "VM_ROL" << p.bitDepth << std::hex
+			<< "\t\t\t Arg1: 0x" << matchData.arg1
+			<< " Arg2: 0x" << matchData.arg2
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmRor) {
+		auto matchData = std::get<VmAluData>(p.matchData);
+		os
+			<< "VM_ROR" << p.bitDepth << std::hex
+			<< "\t\t\t Arg1: 0x" << matchData.arg1
+			<< " Arg2: 0x" << matchData.arg2
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmShl) {
+		auto matchData = std::get<VmAluData>(p.matchData);
+		os
+			<< "VM_SHL" << p.bitDepth << std::hex
+			<< "\t\t\t Arg1: 0x" << matchData.arg1
+			<< " Arg2: 0x" << matchData.arg2
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmShr) {
+		auto matchData = std::get<VmAluData>(p.matchData);
+		os
+			<< "VM_SHR" << p.bitDepth << std::hex
+			<< "\t\t\t Arg1: 0x" << matchData.arg1
+			<< " Arg2: 0x" << matchData.arg2
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmShld) {
+		auto matchData = std::get<VmShldData>(p.matchData);
+		os
+			<< "VM_SHLD" << p.bitDepth << std::hex
+			<< "\t\t\t Dst: 0x" << matchData.dst
+			<< " Src: 0x" << matchData.src
+			<< " Shift: 0x" << matchData.shift
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmShrd) {
+		auto matchData = std::get<VmShldData>(p.matchData);
+		os
+			<< "VM_SHRD" << p.bitDepth << std::hex
+			<< "\t\t\t Dst: 0x" << matchData.dst
+			<< " Src: 0x" << matchData.src
+			<< " Shift: 0x" << matchData.shift
+			<< " Result: 0x" << matchData.result
+			<< " Flags(may not match the trace): 0x" << matchData.flags << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmJmpIndirect) {
+
+		auto matchData = std::get<VmJmpData>(p.matchData);
+		os
+			<< "VM_JMP_INDIRECT" << std::hex 
+			<< "\t\t Dst VIP: 0x" 
+			<< matchData.newVip << std::dec;
+	}
+	else if (p.type == VmHandlerType::Handler_VmDispatch) {
+		std::cout << "VM_DISPATCH";
+	}
+	else if (p.type == VmHandlerType::Handler_VmExit) {
+		auto matchData = std::get<VmExitData>(p.matchData);
+		std::cout << "VM_EXIT { ";
+		for (auto& reg : matchData.popedRegsOrder) {
+			std::cout << reg.name << ' ';
+		}
+		std::cout << "}";
+	}
+
+	return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const VirtualBasicBlock& p) {
+	os << "Block VIP: 0x" << std::hex << p.startAddr << std::dec << '\n';
+	for (auto& instr : p.instructions) {
+		os << instr << '\n';
+	}
+	return os;
 }

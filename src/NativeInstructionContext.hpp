@@ -8,6 +8,7 @@ struct NativeInstructionContext {
 	std::unique_ptr<triton::arch::Instruction> instruction{};
     std::string registerValues{};
     std::string memoryReads{};
+    uint64_t address;
 
 	NativeInstructionContext(triton::Context& ctx, std::string&& instr, std::string&& registersState, std::string&& memoryReads) {
         parseInstruction(ctx, instr);
@@ -69,7 +70,7 @@ struct NativeInstructionContext {
 
         }
     }
-    uint64_t GetRegisterValue(triton::arch::register_e reg) {
+    uint64_t GetRegisterValue(triton::arch::register_e reg) const{
         auto parts = split(registerValues, ':');
         static std::map< triton::arch::register_e, uint64_t> regToIndexMap{
             {triton::arch::register_e::ID_REG_X86_RAX, 0},
@@ -92,6 +93,9 @@ struct NativeInstructionContext {
         auto index = regToIndexMap[reg];
         uint64_t value = std::stoull(parts[index], nullptr, 16);
         return value;
+    }
+    inline uint64_t GetAddress() const noexcept{
+        return address;
     }
 
 private:
@@ -117,7 +121,7 @@ private:
     }
     void parseInstruction(triton::Context& ctx, const std::string& line) {
         auto parts = split(line, ':');
-        uint64_t address = std::stoull(parts[0], nullptr, 16);
+        address = std::stoull(parts[0], nullptr, 16);
         std::vector<uint8_t> opcodeBytes = hexStringToBytes(parts[2]);
         instruction = std::make_unique<triton::arch::Instruction>();
         instruction->setAddress(address);

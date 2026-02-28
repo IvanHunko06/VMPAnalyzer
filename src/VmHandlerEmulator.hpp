@@ -1,6 +1,6 @@
 #pragma once
 #include <triton/context.hpp>
-#include "VmBasicBlock.hpp"
+#include "VmHandlerTrace.hpp"
 #include <map>
 #include <optional>
 
@@ -45,8 +45,8 @@ struct HandlerEmulationData {
 
 
 HandlerEmulationData EmulateVmHandler(
-	const VmBasicBlock& block, 
-	triton::arch::register_e vipRegId, 
+	const VmHandlerTrace& block,
+	triton::arch::register_e vipRegId,
 	triton::arch::register_e vspRegId
 );
 

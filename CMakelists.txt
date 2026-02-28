@@ -31,6 +31,10 @@ if (MSVC)
 target_compile_options(VMPAnalyzer PRIVATE
   $<$<CONFIG:RelWithDebInfo>:/Od>
 )
+add_link_options(
+    $<$<CONFIG:Debug>:/PROFILE>
+    $<$<CONFIG:RelWithDebInfo>:/PROFILE>
+)
 else()
 target_compile_options(VMPAnalyzer PRIVATE
   $<$<CONFIG:RelWithDebInfo>:-O0>
@@ -45,4 +49,3 @@ add_custom_command(TARGET VMPAnalyzer POST_BUILD
     "$<TARGET_FILE:triton::triton>"
     "$<TARGET_FILE_DIR:VMPAnalyzer>"
 )
-

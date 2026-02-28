@@ -3,11 +3,11 @@
 #include <triton/context.hpp>
 #include <triton/x8664Cpu.hpp>
 
-static HandlerEmulationData* currentDataPtr{ nullptr };
+thread_local HandlerEmulationData* currentDataPtr{ nullptr };
 
 void memWriteCallback(triton::Context& ctx, const triton::arch::MemoryAccess& mem) {
 	if (ctx.isMemorySymbolized(mem)) return;
-	
+
 	uint64_t addr = mem.getAddress();
 	size_t size = mem.getSize();
 
@@ -52,7 +52,7 @@ void memReadCallback(triton::Context& ctx, const triton::arch::MemoryAccess& mem
 
 constexpr size_t kAstDeepLevelLimit = 16;
 HandlerEmulationData EmulateVmHandler(
-	const VmBasicBlock& block,
+	const VmHandlerTrace& block,
 	triton::arch::register_e vipRegId,
 	triton::arch::register_e vspRegId
 )
@@ -112,7 +112,8 @@ HandlerEmulationData EmulateVmHandler(
 					readInfo.reg = &context->registers.x86_eflags;
 				}
 				readInfo.instruction = &inst;
-				if (memAccess.second->getLevel() < kAstDeepLevelLimit) {
+				if (memAccess.second->isSymbolized() &&
+					memAccess.second->getLevel() < kAstDeepLevelLimit) {
 					readInfo.ast = context->simplify(memAccess.second, false, true);
 				}
 				else {
@@ -128,7 +129,7 @@ HandlerEmulationData EmulateVmHandler(
 				else {
 					data.logicReads[readInfo.address] = std::move(readInfo);
 				}
-				
+
 			}
 
 			for (auto& memAccess : inst.instruction->getStoreAccess()) {
@@ -151,8 +152,10 @@ HandlerEmulationData EmulateVmHandler(
 					isPushFq = true;
 					context->symbolizeMemory(memAccess.first, "RFLAGS_CLEAN");
 				}
-				
-				if (memAccess.second->getLevel() < kAstDeepLevelLimit && !isPushFq) {
+
+				if (memAccess.second->isSymbolized() && 
+					memAccess.second->getLevel() < kAstDeepLevelLimit &&
+					!isPushFq) {
 					writeInfo.ast = context->simplify(memAccess.second, false, true);
 				}
 				else {
@@ -175,8 +178,13 @@ HandlerEmulationData EmulateVmHandler(
 			if (reg->getId() == triton::arch::ID_REG_X86_RIP) continue;
 			if (!reg->getName().starts_with("r")) continue;
 			auto ast = context->getRegisterAst(*reg);
-
-			data.registerAstMap[reg->getId()] = context->simplify(ast, false, true);
+			if (ast->isSymbolized()) {
+				data.registerAstMap[reg->getId()] = context->simplify(ast, false, true);
+			}
+			else {
+				data.registerAstMap[reg->getId()] = ast;
+			}
+			
 		}
 
 		data.registerAstMap[context->registers.x86_eflags.getId()] = context->simplify(
@@ -232,8 +240,8 @@ void PrintEmulationData(const HandlerEmulationData& data) {
 		std::cout << "  [STORE] Addr: 0x" << std::hex << write.second.address << std::dec
 			<< " Size: " << write.second.size
 			<< " Value: " << write.second.concreteValue << " (";
-		
-			std::cout << write.second.ast << ")\n";
+
+		std::cout << write.second.ast << ")\n";
 	}
 	std::cout << "Logic Reads:\n";
 	for (auto& read : data.logicReads) {
@@ -241,7 +249,7 @@ void PrintEmulationData(const HandlerEmulationData& data) {
 			<< " Size: " << read.second.size
 			<< " Value: " << read.second.concreteValue << " (";
 
-			std::cout << read.second.ast << ")\n";
+		std::cout << read.second.ast << ")\n";
 	}
 
 	std::cout << "System Writes:\n";

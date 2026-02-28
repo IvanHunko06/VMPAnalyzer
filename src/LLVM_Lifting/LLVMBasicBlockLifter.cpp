@@ -159,7 +159,6 @@ llvm::BasicBlock* LLVMBasicBlockLifter::LiftBasicBlock(const VirtualBasicBlock& 
 		case Handler_VmShld: LiftVmShld(logMessages, handler); break;
 		case Handler_VmShrd: LiftVmShrd(logMessages, handler); break;
 		case Handler_VmJmpIndirect:
-		case Handler_VmJmpIndirectRemap:
 			LiftVmJmpIndirect(logMessages, std::get<VmJmpData>(handler.matchData));
 			break;
 		case Handler_VmExit:
@@ -282,7 +281,7 @@ llvm::Value* LLVMBasicBlockLifter::PackFlags(llvm::Value* res, llvm::Value* cf, 
 }
 
 void LLVMBasicBlockLifter::LiftVmPop(bool logDebugMessage, const HandlerMatch& match) {
-	auto& data = std::get<VmPopRegData>(match.matchData);
+	auto& data = std::get<VmContextAccessData>(match.matchData);
 	// 1. Выравнивание (Align down to 8 bytes)
 	int32_t baseOffset = (data.offset / 8) * 8;
 
@@ -345,13 +344,13 @@ void LLVMBasicBlockLifter::LiftVmPop(bool logDebugMessage, const HandlerMatch& m
 
 }
 void LLVMBasicBlockLifter::LiftVmPushReg(bool logDebugMessage, const HandlerMatch& match) {
-	auto& data = std::get<VmPushRegData>(match.matchData);
+	auto& data = std::get<VmContextAccessData>(match.matchData);
 
 	llvm::Value* valueToPush = nullptr;
-	int32_t baseOffset = (data.regOffset / 8) * 8;
+	int32_t baseOffset = (data.offset / 8) * 8;
 
 	auto* virtualContextI8 = builder->CreateBitCast(virtualContext, i8->getPointerTo());
-	auto* slotPtrI8 = builder->CreateConstInBoundsGEP1_32(i8, virtualContextI8, data.regOffset);
+	auto* slotPtrI8 = builder->CreateConstInBoundsGEP1_32(i8, virtualContextI8, data.offset);
 	auto* loadType = GetTypeByDepth(match.bitDepth);
 	auto* typedSlotPtr = builder->CreateBitCast(slotPtrI8, loadType->getPointerTo());
 
@@ -392,7 +391,7 @@ void LLVMBasicBlockLifter::LiftVmPushReg(bool logDebugMessage, const HandlerMatc
 
 		builder->CreateCall(jitLogPushReg, {
 			builder->getInt32(match.bitDepth),
-			builder->getInt64(data.regOffset),
+			builder->getInt64(data.offset),
 			val64
 			});
 	}
@@ -1267,7 +1266,7 @@ void LLVMBasicBlockLifter::LiftVmEntry(const VmEntryHandlerData& data) {
 
 	// 2. Пушим регистры из NativeContext в виртуальный стек
 	// data.popedRegsOrder содержит порядок, в котором VMP ожидает регистры в стеке
-	for (auto& reg : data.popedRegsOrder) {
+	for (auto& reg : data.pushRegsOrder) {
 		int64_t index = GetNativeOffset(reg.id);
 
 		if (index == -1) continue;

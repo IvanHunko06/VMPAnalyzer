@@ -27,8 +27,6 @@ enum VmHandlerType {
 	Handler_VmShrd,
 
 	Handler_VmJmpIndirect,
-	Handler_VmJmpIndirectRemap,
-
 	Handler_VmDispatch,
 
 	Handler_VmExit,
@@ -40,47 +38,52 @@ enum HandlerBitDepth {
 	BitDepth_64 = 64
 };
 
+struct TraceInstructionLocation {
+	uint64_t instAddr;
+	triton::arch::register_e regId;
+};
+
+struct NativeRegData {
+	triton::arch::register_e id{ triton::arch::register_e::ID_REG_INVALID };
+	std::string name{};
+	uint64_t value{ 0 };
+};
+
 struct VmEntryHandlerData {
 	uint64_t imageBaseDifference{ 0 };
-	struct PopedRegData {
-		triton::arch::register_e id{ triton::arch::register_e::ID_REG_INVALID };
-		std::string name{};
-		uint64_t value{ 0 };
-	};
-	std::vector<PopedRegData> popedRegsOrder{};
+	std::vector<NativeRegData> pushRegsOrder{};
 	triton::arch::register_e vspReg{ triton::arch::register_e::ID_REG_INVALID };
 	triton::arch::register_e vipReg{ triton::arch::register_e::ID_REG_INVALID };
 	std::optional<uint64_t> returnAddr;
 	std::optional<uint64_t> pushedConst;
 };
 
-struct VmPopRegData {
-	uint32_t regIndex;
-	uint32_t offset;
-	uint64_t value;
+struct VmContextAccessData {
+	uint32_t regIndex{ 0 };
+	uint32_t offset{ 0 };
+	uint64_t value{ 0 };
+
+	TraceInstructionLocation contextAccess;
 };
 
 struct VmPushConstData {
-	uint64_t value;
+	uint64_t value{ 0 };
+
+	TraceInstructionLocation constData;
 };
 
-struct VmPushRegData {
-	uint32_t regIndex;
-	uint32_t regOffset;
-	uint64_t value;
-};
 
 struct VmMemAccessData {
-	uint64_t address;
-	uint64_t value;
+	uint64_t address{ 0 };
+	uint64_t value{ 0 };
 };
 
 struct VmPushVspData {
-	uint64_t value;
+	uint64_t value{ 0 };
 };
 
 struct VmPopVspData {
-	int64_t offset;
+	int64_t offset{ 0 };
 };
 
 struct VmAluData {
@@ -103,15 +106,12 @@ struct VmJmpData {
 	int64_t newVipShift{ 0 };
 	triton::arch::register_e newVspReg{ triton::arch::register_e::ID_REG_INVALID };
 	triton::arch::register_e newVipReg{ triton::arch::register_e::ID_REG_INVALID };
+
+	TraceInstructionLocation jmpDestData;
 };
 
 struct VmExitData {
-	struct PopedRegData {
-		triton::arch::register_e id{ triton::arch::register_e::ID_REG_INVALID };
-		std::string name{};
-		uint64_t value{ 0 };
-	};
-	std::vector<PopedRegData> popedRegsOrder{};
+	std::vector<NativeRegData> popedRegsOrder{};
 };
 
 struct HandlerMatch {
@@ -124,8 +124,8 @@ struct HandlerMatch {
 	uint64_t vspBefore{ 0 };
 	uint64_t vspAfter{ 0 };
 	std::variant<std::monostate, 
-		VmEntryHandlerData, VmPopRegData, VmPushConstData,
-		VmPushRegData, VmPushVspData, VmMemAccessData,
+		VmEntryHandlerData, VmContextAccessData, VmPushConstData,
+		VmPushVspData, VmMemAccessData,
 		VmAluData, VmShldData, VmJmpData,
 		VmExitData, VmPopVspData> matchData;
 };
@@ -141,3 +141,6 @@ struct VirtualBasicBlock {
 };
 
 std::vector<VirtualBasicBlock> SplitToVirtualBlocks(const std::vector<HandlerMatch>& trace);
+
+std::ostream& operator<<(std::ostream& os, const HandlerMatch& p);
+std::ostream& operator<<(std::ostream& os, const VirtualBasicBlock& p);
