@@ -291,7 +291,7 @@ std::optional<HandlerMatch> TryMatchVmPopReg(const HandlerEmulationData& data) {
 		
 		pushRegData.contextAccess.instAddr = writeInfo.instruction->GetAddress();
 		auto& operand = writeInfo.instruction->instruction->operands[0].getMemory();
-		pushRegData.contextAccess.regId = operand.getIndexRegister().getId();
+		pushRegData.contextAccess.regId = operand.getIndexRegister().getParent();
 
 		match.matchData = pushRegData;
 
@@ -347,7 +347,7 @@ std::optional<HandlerMatch> TryMatchVmPushConst(const HandlerEmulationData& data
 			
 			pushConstData.constData.instAddr = writeInfo.instruction->GetAddress();
 			auto& operand = writeInfo.instruction->instruction->operands[1].getRegister();
-			pushConstData.constData.regId = operand.getId();
+			pushConstData.constData.regId = operand.getParent();
 
 			match.matchData = std::move(pushConstData);
 			return match;
@@ -387,7 +387,7 @@ std::optional<HandlerMatch> TryMatchVmPushReg(const HandlerEmulationData& data) 
 
 		pushRegData.contextAccess.instAddr = readInfo.instruction->GetAddress();
 		auto& operand = readInfo.instruction->instruction->operands[1].getMemory();
-		pushRegData.contextAccess.regId = operand.getIndexRegister().getId();
+		pushRegData.contextAccess.regId = operand.getIndexRegister().getParent();
 		foundRead = true;
 		break;
 	}
@@ -935,7 +935,7 @@ std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationDat
 	jmpData.newVipShift = *shift;
 	jmpData.jmpDestData.instAddr = instr->GetAddress();
 	auto& operand = instr->instruction->operands[0].getRegister();
-	jmpData.jmpDestData.regId = operand.getId();
+	jmpData.jmpDestData.regId = operand.getParent();
 
 	auto vspRegAst = data.registerAstMap.at(jmpData.newVspReg);
 	if (!vspRegAst) return std::nullopt;

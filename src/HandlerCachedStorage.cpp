@@ -2,6 +2,8 @@
 
 void HandlerCachedStorage::CacheInstruction(const HandlerMatch& match) {
 	if (!enabled_) return;
+
+	std::unique_lock<std::shared_mutex> lock(mutex_);
 	if (handlers_.contains(match.addr)) return;
 
 	CachedHandlerInfo info;
@@ -34,6 +36,8 @@ std::optional<HandlerMatch> HandlerCachedStorage::TryGetCachedInstruction(
 	triton::arch::register_e vspReg) 
 {
 	if (!enabled_) return std::nullopt;
+
+	std::shared_lock<std::shared_mutex> lock(mutex_);
 
 	auto cachedDataIt = handlers_.find(addr);
 	if (cachedDataIt == handlers_.end()) return std::nullopt;
@@ -84,7 +88,9 @@ std::optional<HandlerMatch> HandlerCachedStorage::TryGetCachedInstruction(
 	}
 	else if (cachedData.type == Handler_VmPushConst) {
 		VmPushConstData data;
-		data.value = GetDataFromTrace(trace, cachedData.constData);
+		uint64_t rawValue = GetDataFromTrace(trace, cachedData.constData);
+		uint64_t mask = (cachedData.bitDepth == 64) ? ~0ULL : ((1ULL << cachedData.bitDepth) - 1);
+		data.value = rawValue & mask;
 		match.matchData = data;
 	}
 	else if (cachedData.type == Handler_VmJmpIndirect) {

@@ -1,5 +1,6 @@
 #include <map>
 #include <optional>
+#include <shared_mutex>
 #include "VmHandlerMatcher.hpp"
 #include "VmHandlerTrace.hpp"
 
@@ -23,6 +24,7 @@ private:
 		TraceInstructionLocation contextAccessLocation;
 	};
 	std::map<uint64_t, CachedHandlerInfo> handlers_;
+	std::shared_mutex mutex_;
 	bool enabled_;
 
 public:
