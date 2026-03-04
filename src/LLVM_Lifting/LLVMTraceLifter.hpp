@@ -20,10 +20,6 @@ private:
 	llvm::Function* function;
 	std::map<uint64_t, llvm::BasicBlock*> virtualBasicBlockMap;
 
-	llvm::BasicBlock* entryBasicBlock;
-	llvm::BasicBlock* dispatchBlock;
-	llvm::BasicBlock* exitBlock;
-
 	llvm::Type* i64;
 	llvm::Type* i32;
 	llvm::Type* i16;
@@ -37,12 +33,10 @@ private:
 	llvm::Value* imageBaseDif;
 	llvm::Value* realStackPtr;
 	llvm::AllocaInst* targetVip;
-	llvm::SwitchInst* dispatchSwitch;
-	llvm::BasicBlock* protectedCodeEntryBlock;
 	friend class CFGRepatcher;
 
 public:
-	LLVMTraceLifter(const std::vector<VirtualBasicBlock> basicBlocks);
+	LLVMTraceLifter(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock);
 	void OptimizeModule(bool enableO3Optimization);
 	void PrintModule() {
 		llvm::outs() << "\n[LLVM IR DUMP START]\n";
@@ -62,5 +56,5 @@ public:
 private:
 	void CreateNativeContextType();
 	void CreateFunction(const char* functionName);
-	void LiftTraceFunction(const std::vector<VirtualBasicBlock> basicBlocks);
+	void LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock);
 };
