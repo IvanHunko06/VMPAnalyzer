@@ -13,6 +13,8 @@
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 
+#include "VmpDevirtualizationPass.hpp"
+
 LLVMTraceLifter::LLVMTraceLifter(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock) {
 	using namespace llvm;
 
@@ -212,6 +214,7 @@ void LLVMTraceLifter::OptimizeModule(bool enableO3Optimization) {
 		// O3 делает SROA (Scalar Replacement), что иногда оставляет "ошметки" математики.
 		// Контрольный проход сворачивает их окончательно.
 		FunctionPassManager FPM;
+		FPM.addPass(VmpDevirtualizationPass());
 		FPM.addPass(InstCombinePass());
 		FPM.addPass(SimplifyCFGPass());
 
