@@ -1287,14 +1287,11 @@ void LLVMBasicBlockLifter::LiftVmEntry(const VmEntryHandlerData& data) {
 	}
 
 	// 3. Пушим ImageBaseDifference (аргумент функции)
-	Push(imageBaseDif, BitDepth_64);
+	//Push(imageBaseDif, BitDepth_64);
+	Push(builder->getInt64(0), BitDepth_64);
 }
 void LLVMBasicBlockLifter::LiftVmJmpIndirect(bool logDebugMessage, const VmJmpData& jmpData) {
 	llvm::Value* rawAddr = Pop(BitDepth_64).value;
-	//auto* targetAddr = builder->CreateAdd(
-	//	rawAddr,
-	//	builder->getInt64(jmpData.newVipShift),
-	//	"jmp_target_addr");
 
 	auto* targetAddr = rawAddr;
 
@@ -1401,28 +1398,25 @@ void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& da
 		builder->CreateStore(value, regPtr);
 	}
 
+	// 4. Записываем rsp в контекст
+	{
+		auto* rspValue = builder->CreateConstInBoundsGEP1_64(
+			i8,
+			realStackPtr,
+			realStackOffset,
+			"final_rsp"
+		);
+		llvm::Value* regPtr = builder->CreateStructGEP(
+			nativeContextType,
+			nativeContext,
+			static_cast<unsigned int>(rspOffset),
+			"native_rsp"
+		);
+		builder->CreateStore(rspValue, regPtr);
+	}
+
 	// 4. Сигнализируем Диспетчеру (TraceLifter), что нужно остановиться.
 	// Запись 0 в targetVip приведет к выходу из switch-цикла диспетчера.
 	builder->CreateStore(builder->getInt64(0), targetVip);
-
-	//if (shadowStack.Size() > 0) {
-	//	FlushVsp(true, );
-
-	//	auto* realStackI8 = builder->CreateBitCast(
-	//		realStackPtr,
-	//		i8->getPointerTo()
-	//	);
-
-	//	for (int i = 0; i < 18; ++i) {
-	//		auto* realStackGep = builder->CreateConstGEP1_64(
-	//			i8,
-	//			realStackI8,
-	//			realStackOffset + i * 8
-	//		);
-	//		auto* typedStackGep = builder->CreateBitCast(realStackGep, i64->getPointerTo());
-	//		builder->CreateStore(builder->getInt64(0), typedStackGep);
-	//	}
-	//}
-
 
 }

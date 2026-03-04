@@ -24,6 +24,18 @@ struct BasicBlockLifterConstructor {
 	llvm::Value* targetVip;
 };
 
+struct StackAddressMeta {
+	bool isInStackAddress{ false }; // явл€етс€ ли это значение адресом в стеке (дл€ оптимизаций доступа к стеку)
+	int32_t slotAbsoluteBase{ 0 };
+	int32_t relativeOffset{ 0 };
+};
+
+struct BasicBlockLifterState {
+	std::map<int32_t, StackAddressMeta> addressMetasStorage;
+	int64_t virtualStackOffset = 0;
+	int64_t realStackOffset{ 0 };
+};
+
 class LLVMBasicBlockLifter {
 	llvm::LLVMContext* context;
 	llvm::Module* llvmModule;
@@ -57,11 +69,6 @@ private:
 			ADD, NOR, NAND, SHL, SHR, SHLD, SHRD
 		} operation;
 	};
-	struct StackAddressMeta {
-		bool isInStackAddress{ false }; // явл€етс€ ли это значение адресом в стеке (дл€ оптимизаций доступа к стеку)
-		int32_t slotAbsoluteBase{ 0 };
-		int32_t relativeOffset{ 0 };
-	};
 	struct StackMetadata {
 		bool isPadding{ false };
 		StackAddressMeta addressMeta;
@@ -79,13 +86,25 @@ private:
 
 	int64_t virtualStackOffset = 0;
 	int64_t realStackOffset{ 0 };
-	int64_t virtualToRealStackDif{ 0 };
 
 public:
 	LLVMBasicBlockLifter(const BasicBlockLifterConstructor& ctor);
 	
 	llvm::BasicBlock* LiftBasicBlock(const VirtualBasicBlock& vbb, bool useMemoryHooks = true, bool logMessages = false);
 	void FlushVsp(bool clearStack, bool writeToRealStack);
+	BasicBlockLifterState SaveState() {
+		BasicBlockLifterState state;
+		state.addressMetasStorage = addressMetasStorage;
+		state.realStackOffset = realStackOffset;
+		state.virtualStackOffset = virtualStackOffset;
+		return state;
+	}
+	void ApplyState(const BasicBlockLifterState& state) {
+		addressMetasStorage = state.addressMetasStorage;
+		realStackOffset = state.realStackOffset;
+		virtualStackOffset = state.virtualStackOffset;
+	}
+
 private:
 #pragma region JIT Functions
 	llvm::FunctionCallee jitReadFunc;

@@ -18,11 +18,13 @@ struct NativeContext {
 	uint64_t r14Reg{ 0 };
 	uint64_t r15Reg{ 0 };
 	uint64_t rflagsReg{ 0 };
+	uint64_t rspReg{ 0 };
 	uint64_t retAddr{ 0 };
 	uint64_t vmExitAddr{ 0 };
 };
-constexpr int64_t retAddrOffset = 16;
-constexpr int64_t vmExitAddr = 17;
+constexpr int64_t rspOffset = 16;
+constexpr int64_t retAddrOffset = 17;
+constexpr int64_t vmExitAddr = 18;
 
 static int64_t GetNativeOffset(triton::arch::register_e reg) {
 	switch (reg)
