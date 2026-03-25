@@ -94,18 +94,20 @@ int main(int argc, char* argv[]) {
 				auto data = EmulateVmHandler(trace, vipReg, vspReg);
 
 				currentHandler = MatchVmHandler(data);
-				if (currentHandler.type != Handler_VmEntry &&
-					currentHandler.type != Handler_VmExit &&
-					currentHandler.type != Handler_VmPopVsp) {
-
-					cacheStorage.CacheInstruction(currentHandler);
-				}
-
 				if (currentHandler.type == Handler_Unknown) {
 					std::lock_guard<std::mutex> lock(printErrorMutex);
 					PrintBasicBlock(trace);
 					std::cout << '\n';
 					PrintEmulationData(data);
+					continue;
+				}
+
+				if (currentHandler.type != Handler_VmEntry &&
+					currentHandler.type != Handler_VmExit &&
+					currentHandler.type != Handler_VmPopVsp &&
+					currentHandler.type != Handler_Unknown) {
+
+					cacheStorage.CacheInstruction(currentHandler);
 				}
 
 			}
