@@ -1,6 +1,7 @@
 #pragma once
 #include <triton/architecture.hpp>
 #include "VmHandlerEmulator.hpp"
+#include "VmHandlerTrace.hpp"
 #include <variant>
 
 enum VmHandlerType {
@@ -131,7 +132,7 @@ struct HandlerMatch {
 };
 
 
-HandlerMatch MatchVmHandler(const HandlerEmulationData& data);
+HandlerMatch MatchVmHandler(const HandlerEmulationData& data, const VmHandlerTrace& trace);
 
 struct VirtualBasicBlock {
 	uint64_t startAddr{ 0 };

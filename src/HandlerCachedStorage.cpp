@@ -105,6 +105,9 @@ std::optional<HandlerMatch> HandlerCachedStorage::TryGetCachedInstruction(
 		match.matchData = data;
 
 	}
+	else if (cachedData.type == Handler_VmDispatch) {
+
+	}
 	else {
 		__debugbreak();
 	}

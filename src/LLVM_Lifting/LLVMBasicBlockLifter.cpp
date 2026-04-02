@@ -859,13 +859,13 @@ void LLVMBasicBlockLifter::LiftVmAdd(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.op1 = valA;
 	flagsPromise.op2 = valB;
 	flagsPromise.operation = FlagsPromise::ADD;
-	flagsPromise.res = nullptr;
 	flagsPromise.opType = calcType;
+	flagsPromise.res = CalculateFlagsFromPromise(flagsPromise);
 
 	StackMetadata flagsMeta;
 	flagsMeta.flagsPromise = flagsPromise;
 
-	shadowStack.Push(BitDepth_64, nullptr, flagsMeta);
+	shadowStack.Push(BitDepth_64, flagsPromise.res, flagsMeta);
 
 	if (logDebugMessage) {
 		if (result->getType()->isPointerTy()) {
@@ -908,13 +908,13 @@ void LLVMBasicBlockLifter::LiftVmNor(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.op1 = valA;
 	flagsPromise.op2 = valB;
 	flagsPromise.operation = FlagsPromise::NOR;
-	flagsPromise.res = nullptr;
 	flagsPromise.opType = flagsType;
+	flagsPromise.res = CalculateFlagsFromPromise(flagsPromise);
 
 	StackMetadata flagsMeta;
 	flagsMeta.flagsPromise = flagsPromise;
 
-	shadowStack.Push(BitDepth_64, nullptr, flagsMeta);
+	shadowStack.Push(BitDepth_64, flagsPromise.res, flagsMeta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogNor, {
@@ -954,13 +954,13 @@ void LLVMBasicBlockLifter::LiftVmNand(bool logDebugMessage, const HandlerMatch& 
 	flagsPromise.op1 = valA;
 	flagsPromise.op2 = valB;
 	flagsPromise.operation = FlagsPromise::NOR;
-	flagsPromise.res = nullptr;
 	flagsPromise.opType = flagsType;
+	flagsPromise.res = CalculateFlagsFromPromise(flagsPromise);
 
 	StackMetadata flagsMeta;
 	flagsMeta.flagsPromise = flagsPromise;
 
-	shadowStack.Push(BitDepth_64, nullptr, flagsMeta);
+	shadowStack.Push(BitDepth_64, flagsPromise.res, flagsMeta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogNand, {
@@ -995,12 +995,12 @@ void LLVMBasicBlockLifter::LiftVmShl(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.op1 = val;
 	flagsPromise.op2 = amt;
 	flagsPromise.operation = FlagsPromise::SHL;
-	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
+	flagsPromise.res = CalculateFlagsFromPromise(flagsPromise);
 
 	StackMetadata meta;
 	meta.flagsPromise = flagsPromise;
-	shadowStack.Push(BitDepth_64, nullptr, meta);
+	shadowStack.Push(BitDepth_64, flagsPromise.res, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShl, {
@@ -1034,13 +1034,13 @@ void LLVMBasicBlockLifter::LiftVmShr(bool logDebugMessage, const HandlerMatch& m
 	flagsPromise.op1 = val;
 	flagsPromise.op2 = amt;
 	flagsPromise.operation = FlagsPromise::SHR;
-	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
+	flagsPromise.res = CalculateFlagsFromPromise(flagsPromise);
 
 	StackMetadata meta;
 	meta.flagsPromise = flagsPromise;
 
-	shadowStack.Push(BitDepth_64, nullptr, meta);
+	shadowStack.Push(BitDepth_64, flagsPromise.res, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShl, {
@@ -1087,13 +1087,13 @@ void LLVMBasicBlockLifter::LiftVmShld(bool logDebugMessage, const HandlerMatch& 
 	flagsPromise.op2 = src;
 	flagsPromise.op3 = count;
 	flagsPromise.operation = FlagsPromise::SHLD;
-	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
+	flagsPromise.res = CalculateFlagsFromPromise(flagsPromise);
 
 	StackMetadata meta;
 	meta.flagsPromise = flagsPromise;
 
-	shadowStack.Push(BitDepth_64, nullptr, meta);
+	shadowStack.Push(BitDepth_64, flagsPromise.res, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShld, {
@@ -1142,13 +1142,13 @@ void LLVMBasicBlockLifter::LiftVmShrd(bool logDebugMessage, const HandlerMatch& 
 	flagsPromise.op2 = src;
 	flagsPromise.op3 = count;
 	flagsPromise.operation = FlagsPromise::SHRD;
-	flagsPromise.res = nullptr;
 	flagsPromise.opType = opType;
+	flagsPromise.res = CalculateFlagsFromPromise(flagsPromise);
 
 	StackMetadata meta;
 	meta.flagsPromise = flagsPromise;
 
-	shadowStack.Push(BitDepth_64, nullptr, meta);
+	shadowStack.Push(BitDepth_64, flagsPromise.res, meta);
 
 	if (logDebugMessage) {
 		builder->CreateCall(jitLogShrd, {

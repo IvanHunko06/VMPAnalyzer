@@ -2,6 +2,8 @@
 #include "triton/x8664Cpu.hpp"
 #include <optional>
 #include <iomanip>
+#include <algorithm>
+#include <ranges>
 
 bool IsVariable(const triton::ast::SharedAbstractNode& node, const std::string& name) {
 	if (node->getType() == triton::ast::VARIABLE_NODE) {
@@ -875,7 +877,7 @@ std::optional<HandlerMatch> TryMatchVmDoubleShift(const HandlerEmulationData& da
 	return match;
 }
 
-std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationData& data) {
+std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationData& data, const VmHandlerTrace& trace) {
 	if (!data.vipAst || !data.vspAst) return std::nullopt;
 
 	HandlerMatch match;
@@ -908,6 +910,14 @@ std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationDat
 	else {
 		for (auto& candidat : vspCandidats) {
 			if (candidat == data.vspRegId) continue;
+			auto it = std::ranges::find_if(trace.instructions, [candidat](const NativeInstructionContext& instr) {
+				auto& tritonInstr = instr.instruction;
+				if (tritonInstr->getType() != triton::arch::x86::ID_INS_MOV) return false;
+				auto& operand2 = tritonInstr->operands[1];
+				if (operand2.getType() != triton::arch::OP_REG) return false;
+				return operand2.getRegister().getId() == candidat;
+				});
+			if (it != trace.instructions.end()) continue;
 			jmpData.newVspReg = candidat;
 			break;
 		}
@@ -1018,7 +1028,7 @@ std::optional<HandlerMatch> TryMatchVmDispatch(const HandlerEmulationData& data)
 	return match;
 }
 
-HandlerMatch MatchVmHandler(const HandlerEmulationData& data) {
+HandlerMatch MatchVmHandler(const HandlerEmulationData& data, const VmHandlerTrace& trace) {
 
 	auto isVmEntryHandler = TryMatchVmEntry(data);
 	if (isVmEntryHandler) return *isVmEntryHandler;
@@ -1050,7 +1060,7 @@ HandlerMatch MatchVmHandler(const HandlerEmulationData& data) {
 	auto isVmDoubleShft = TryMatchVmDoubleShift(data);
 	if (isVmDoubleShft) return *isVmDoubleShft;
 
-	auto isVmJmpIndirectRemap = TryMatchVmJmpIndirectRemap(data);
+	auto isVmJmpIndirectRemap = TryMatchVmJmpIndirectRemap(data, trace);
 	if (isVmJmpIndirectRemap) return *isVmJmpIndirectRemap;
 
 	auto isVmDispatch = TryMatchVmDispatch(data);

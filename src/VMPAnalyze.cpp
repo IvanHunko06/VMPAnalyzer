@@ -93,7 +93,7 @@ int main(int argc, char* argv[]) {
 			if (!cachedHandler) {
 				auto data = EmulateVmHandler(trace, vipReg, vspReg);
 
-				currentHandler = MatchVmHandler(data);
+				currentHandler = MatchVmHandler(data, trace);
 				if (currentHandler.type == Handler_Unknown) {
 					std::lock_guard<std::mutex> lock(printErrorMutex);
 					PrintBasicBlock(trace);
@@ -101,6 +101,13 @@ int main(int argc, char* argv[]) {
 					PrintEmulationData(data);
 					continue;
 				}
+
+				//if (currentHandler.type == Handler_VmJmpIndirect) {
+				//	std::lock_guard<std::mutex> lock(printErrorMutex);
+				//	PrintBasicBlock(trace);
+				//	std::cout << '\n';
+				//	PrintEmulationData(data);
+				//}
 
 				if (currentHandler.type != Handler_VmEntry &&
 					currentHandler.type != Handler_VmExit &&
@@ -127,6 +134,10 @@ int main(int argc, char* argv[]) {
 				auto matchData = std::get<VmJmpData>(currentHandler.matchData);
 				vipReg = matchData.newVipReg;
 				vspReg = matchData.newVspReg;
+			}
+
+			if (currentHandler.type == Handler_VmExit) {
+				break;
 			}
 		}
 
