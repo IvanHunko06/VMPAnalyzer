@@ -467,12 +467,14 @@ std::optional<HandlerMatch> TryMatchVmPopVsp(const HandlerEmulationData& data) {
 	if (!data.vipAst || !data.vspAst) return std::nullopt;
 
 	if (!IsVariable(*data.vspAst, "StackArg_0")) return std::nullopt;
-
+	
 	bool hasWrites = true;
 	if (data.systemReads.size() < 256 ||
 		data.systemWrites.size() < 256) {
 		hasWrites = false;
 	}
+
+	if (data.logicReads.size() > 8) return std::nullopt;
 
 	int64_t vspDelta = data.vspChange.endValue - data.vspChange.startValue;
 	if (hasWrites && vspDelta > 0) return std::nullopt;
@@ -879,6 +881,8 @@ std::optional<HandlerMatch> TryMatchVmDoubleShift(const HandlerEmulationData& da
 
 std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationData& data, const VmHandlerTrace& trace) {
 	if (!data.vipAst || !data.vspAst) return std::nullopt;
+
+	if (data.logicReads.size() > 8) return std::nullopt;
 
 	HandlerMatch match;
 	match.type = Handler_VmJmpIndirect;
