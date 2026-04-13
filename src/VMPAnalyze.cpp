@@ -9,21 +9,25 @@
 #include <execution>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 void PrintHelp() {
-	std::cout << "-input <path>  - path to the trace file\n";
-	std::cout << "-use_cache     - use cache for fast matching. Not all handlers will have full data available.\n";
-	std::cout << "-print_blocks  - displays all found virtual blocks\n";
-	std::cout << "-output <path> - path to the output IR file\n";
+	std::cout << "-input <path>						 - path to the trace file\n";
+	std::cout << "-use_cache						 - use cache for fast matching. Not all handlers will have full data available.\n";
+	std::cout << "-print_blocks						 - displays all found virtual blocks\n";
+	std::cout << "-output <path>					 - path to the output IR file\n";
+	std::cout << "-no_optimize						 - don`t optimize lifted IR\n";
+	std::cout << "-llvm_override_stack_size <size>   - override llvm default stack size (4096) with custom value. Can be useful for handlers with big stack frames\n";
+	std::cout << "-llvm_override_aslr_dif   <diff>   - ASLR difference between image base during trace recording and current image base. Can be useful for correct resolving of some handlers (like VmJmpIndirect). Required for llvm lifting\n";
 }
-std::string ReadPath(char** args, int argsCount, int* curArgIndex, const char* pathName) {
+std::string ReadString(char** args, int argsCount, int* curArgIndex, const char* argName) {
 	const char* curArg = args[*curArgIndex];
-	if (strcmp(curArg, pathName) == 0) {
+	if (strcmp(curArg, argName) == 0) {
 		if (*curArgIndex + 1 < argsCount) {
-			char* path = args[++*curArgIndex];
-			if (path[0] == '-') throw std::runtime_error("Invalid path argument");
-			if (path[0] == ' ') throw std::runtime_error("Invalid path argument");
+			char* value = args[++*curArgIndex];
+			if (value[0] == '-') throw std::runtime_error("Invalid string argument");
+			if (value[0] == ' ') throw std::runtime_error("Invalid string argument");
 			++*curArgIndex;
-			return path;
+			return value;
 		}
 	}
 
@@ -43,16 +47,19 @@ bool ReadFlag(char** args, int argsCount, int* curArgIndex, const char* flagName
 int main(int argc, char* argv[]) {
 	std::vector<std::string> inputFiles;
 	std::string outputFile = "vm_lifted_module.ll";
+	uint32_t overrideStackSize = 0;
+	std::atomic<uint64_t> imageBaseAslrDiff = 0;
 	bool useCaching = false;
 	bool printBasicBlocks = false;
+	bool optimize = true;
 
 	for (int i = 1; i < argc; ) {
-		auto inputPath = ReadPath(argv, argc, &i, "-input");
+		auto inputPath = ReadString(argv, argc, &i, "-input");
 		if (!inputPath.empty()) {
 			inputFiles.push_back(inputPath);
 			continue;
 		}
-		auto outputPath = ReadPath(argv, argc, &i, "-output");
+		auto outputPath = ReadString(argv, argc, &i, "-output");
 		if (!outputPath.empty()){
 			outputFile = outputPath;
 			continue;
@@ -67,6 +74,27 @@ int main(int argc, char* argv[]) {
 			printBasicBlocks = true;
 			continue;
 		}
+
+		if (ReadFlag(argv, argc, &i, "-no_optimize")) {
+			optimize = false;
+			continue;
+		}
+
+		auto overrideStackSizeStr = ReadString(argv, argc, &i, "-llvm_override_stack_size");
+		if (!overrideStackSizeStr.empty()) {
+			int base = 10;
+			if (overrideStackSizeStr.starts_with("0x")) base = 16;
+			overrideStackSize = std::stoi(overrideStackSizeStr, nullptr, base);
+			continue;
+		}
+
+		//auto imageBaseAslrDiffStr = ReadString(argv, argc, &i, "-image_base_aslr_diff");
+		//if (!imageBaseAslrDiffStr.empty()) {
+		//	int base = 10;
+		//	if (imageBaseAslrDiffStr.starts_with("0x")) base = 16;
+		//	imageBaseAslrDiff = std::stoull(imageBaseAslrDiffStr, nullptr, base);
+		//	continue;
+		//}
 
 		PrintHelp();
 		return -1;
@@ -128,6 +156,7 @@ int main(int argc, char* argv[]) {
 				auto matchData = std::get<VmEntryHandlerData>(currentHandler.matchData);
 				vipReg = matchData.vipReg;
 				vspReg = matchData.vspReg;
+				imageBaseAslrDiff.store(matchData.imageBaseDifference, std::memory_order_relaxed);
 			}
 
 			if (currentHandler.type == VmHandlerType::Handler_VmJmpIndirect) {
@@ -200,8 +229,9 @@ int main(int argc, char* argv[]) {
 
 
 	
-	LLVMTraceLifter lifter(blockTransitions, &uniqueBasicBlocks.front());
-	lifter.OptimizeModule(true);
+	LLVMTraceLifter lifter(overrideStackSize, imageBaseAslrDiff.load(std::memory_order_relaxed));
+	lifter.LiftTraceFunction(blockTransitions, &uniqueBasicBlocks.front());
+	if (optimize) lifter.OptimizeModule(true);
 	lifter.PrintModule();
 	
 	lifter.DumpModuleToFile(outputFile);

@@ -19,6 +19,7 @@ LLVMBasicBlockLifter::LLVMBasicBlockLifter(const BasicBlockLifterConstructor& ct
 	this->targetVip = ctor.targetVip;
 	this->virtualContext = ctor.virtualContext;
 	this->realStackPtr = ctor.realStackPtr;
+	this->aslrDifference = ctor.aslrDifference;
 
 	i64 = Type::getInt64Ty(*context);
 	i32 = Type::getInt32Ty(*context);
@@ -158,6 +159,7 @@ llvm::BasicBlock* LLVMBasicBlockLifter::LiftBasicBlock(const VirtualBasicBlock& 
 		case Handler_VmShr: LiftVmShr(logMessages, handler); break;
 		case Handler_VmShld: LiftVmShld(logMessages, handler); break;
 		case Handler_VmShrd: LiftVmShrd(logMessages, handler); break;
+		case Handler_VmRdtsc: LiftRdtsc(logMessages); break;
 		case Handler_VmJmpIndirect:
 			LiftVmJmpIndirect(logMessages, std::get<VmJmpData>(handler.matchData));
 			break;
@@ -645,7 +647,7 @@ void LLVMBasicBlockLifter::LiftVmPopVsp(bool logDebugMessage, const HandlerMatch
 		meta);
 
 	if (vspPopData.offset > 0) {
-		FlushVsp(true, false);
+		FlushVsp(true, true);
 	}
 
 	//FlushVsp(true);
@@ -805,27 +807,29 @@ void LLVMBasicBlockLifter::LiftVmAdd(bool logDebugMessage, const HandlerMatch& m
 
 	if (valBAddrMeta.isInStackAddress && !valAAddrMeta.isInStackAddress) {
 		slotAbsoluteBase = valBAddrMeta.slotAbsoluteBase;
-		//valB = builder->getInt64(
-		//	fakeStackBase +
-		//	valBAddrMeta.slotAbsoluteBase +
-		//	valBAddrMeta.relativeOffset
-		//);
 		hasSignleVspOperand = true;
 		auto constValue = GetConstantInt(valA);
 		if (constValue) relativeOffset = valBAddrMeta.relativeOffset + *constValue;
-		else __debugbreak();
+		else {
+			// Если оба операнда - не константы, то мы не можем точно определить смещение, на которое будет указывать результат
+			// В этом случае лучше отказаться от оптимизации и считать, что результат не будет в стеке
+			hasSignleVspOperand = false;
+			relativeOffset = 0;
+			slotAbsoluteBase = 0;
+		}
 	}
 	else if (valAAddrMeta.isInStackAddress && !valBAddrMeta.isInStackAddress) {
 		slotAbsoluteBase = valAAddrMeta.slotAbsoluteBase;
-		//valA = builder->getInt64(
-		//	fakeStackBase +
-		//	valASlot.metadata.slotAbsoluteBase +
-		//	valASlot.metadata.relativeOffset
-		//);
 		hasSignleVspOperand = true;
 		auto constValue = GetConstantInt(valB);
 		if (constValue) relativeOffset = valAAddrMeta.relativeOffset + *constValue;
-		else __debugbreak();
+		else {
+			// Если оба операнда - не константы, то мы не можем точно определить смещение, на которое будет указывать результат
+			// В этом случае лучше отказаться от оптимизации и считать, что результат не будет в стеке
+			hasSignleVspOperand = false;
+			relativeOffset = 0;
+			slotAbsoluteBase = 0;
+		}
 	}
 
 	calcType = GetTypeByDepth(match.bitDepth);
@@ -838,9 +842,9 @@ void LLVMBasicBlockLifter::LiftVmAdd(bool logDebugMessage, const HandlerMatch& m
 	}
 
 	if (hasSignleVspOperand && fakeStackBase + relativeOffset + slotAbsoluteBase > fakeStackBase) {
-		hasSignleVspOperand = false;
-		relativeOffset = 0;
-		slotAbsoluteBase = 0;
+		//hasSignleVspOperand = false;
+		//relativeOffset = 0;
+		//slotAbsoluteBase = 0;
 	}
 
 	result = builder->CreateAdd(valA, valB, "add_res");
@@ -1177,7 +1181,11 @@ void LLVMBasicBlockLifter::GenerateStackMemoryAccess(
 	else { // READ
 		llvm::Value* loadedStackVal = builder->CreateLoad(dataType, typedPtr, "stack_load");
 		auto bitWidth = dataType->getIntegerBitWidth();
-		auto pushDepth = (bitWidth == 8) ? BitDepth_16 : static_cast<HandlerBitDepth>(bitWidth);
+		auto pushDepth = static_cast<HandlerBitDepth>(bitWidth);
+		if (bitWidth == 8) {
+			loadedStackVal = builder->CreateZExt(loadedStackVal, i16); // Для 8 бит расширяем до 16, так как в виртуальном стеке для 8-битных значений всегда выделяется 16 бит
+			pushDepth = BitDepth_16;
+		}
 		Push(loadedStackVal, pushDepth);
 	}
 }
@@ -1225,7 +1233,10 @@ void LLVMBasicBlockLifter::GenerateRamMemoryAccess(
 
 	if (loadedRamVal) {
 		unsigned bitWidth = dataType->getIntegerBitWidth();
-		if (bitWidth == 8) bitWidth = 16; // Правило для 8 бит: расширяем до 16 при чтении из RAM
+		if (bitWidth == 8) {
+			bitWidth = 16; // Правило для 8 бит: расширяем до 16 при чтении из RAM
+			loadedRamVal = builder->CreateZExt(loadedRamVal, i16); // Изначально 8 бит, расширяем до 16, так как в виртуальном стеке для 8-битных значений всегда выделяется 16 бит
+		}
 		Push(loadedRamVal, (HandlerBitDepth)bitWidth);
 	}
 
@@ -1288,7 +1299,7 @@ void LLVMBasicBlockLifter::LiftVmEntry(const VmEntryHandlerData& data) {
 
 	// 3. Пушим ImageBaseDifference (аргумент функции)
 	//Push(imageBaseDif, BitDepth_64);
-	Push(builder->getInt64(0), BitDepth_64);
+	Push(builder->getInt64(aslrDifference), BitDepth_64);
 }
 void LLVMBasicBlockLifter::LiftVmJmpIndirect(bool logDebugMessage, const VmJmpData& jmpData) {
 	llvm::Value* rawAddr = Pop(BitDepth_64).value;
@@ -1419,4 +1430,13 @@ void LLVMBasicBlockLifter::LiftVmExit(bool logDebugMessage, const VmExitData& da
 	// Запись 0 в targetVip приведет к выходу из switch-цикла диспетчера.
 	builder->CreateStore(builder->getInt64(0), targetVip);
 
+}
+
+void LLVMBasicBlockLifter::LiftRdtsc(bool logDebugMessage) {
+	using namespace llvm;
+	//auto saddFunc = Intrinsic::getDeclaration(llvmModule, Intrinsic::sadd_with_overflow, { promise.opType });
+
+	auto readcyclecounterFunc = Intrinsic::getDeclaration(llvmModule, Intrinsic::readcyclecounter);
+	Value* rdtscVal = builder->CreateCall(readcyclecounterFunc, {}, "rdtsc");
+	Push(rdtscVal, BitDepth_64);
 }

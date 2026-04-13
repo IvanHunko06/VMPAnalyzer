@@ -30,6 +30,8 @@ enum VmHandlerType {
 	Handler_VmJmpIndirect,
 	Handler_VmDispatch,
 
+	Handler_VmRdtsc,
+
 	Handler_VmExit,
 };
 enum HandlerBitDepth {

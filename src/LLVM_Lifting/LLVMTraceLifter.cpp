@@ -15,12 +15,13 @@
 
 #include "VmpDevirtualizationPass.hpp"
 
-LLVMTraceLifter::LLVMTraceLifter(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock) {
+LLVMTraceLifter::LLVMTraceLifter(uint32_t overrideStackSize, uint64_t aslrDifference) {
 	using namespace llvm;
 
 	llvmContext = std::make_unique<LLVMContext>();
 	llvmModule = std::make_unique<Module>("vm_lifted", *llvmContext);
 	llvmIrBuilder = std::make_unique<IRBuilder<>>(*llvmContext);
+	this->aslrDifference = aslrDifference;
 
 	i64 = Type::getInt64Ty(*llvmContext);
 	i32 = Type::getInt32Ty(*llvmContext);
@@ -28,10 +29,12 @@ LLVMTraceLifter::LLVMTraceLifter(std::map<VirtualBasicBlock*, std::vector<Virtua
 	i8 = Type::getInt8Ty(*llvmContext);
 	voidTy = Type::getVoidTy(*llvmContext);
 	ptrTy = Type::getInt64PtrTy(*llvmContext);
+	if (overrideStackSize > 0) {
+		defaultStackSize = overrideStackSize;
+	}
 
 	CreateNativeContextType();
 	CreateFunction("ProtectedTrace");
-	LiftTraceFunction(transitions, startBasicBlock);
 }
 
 void LLVMTraceLifter::CreateNativeContextType() {
@@ -73,12 +76,12 @@ void LLVMTraceLifter::LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector
 	llvmIrBuilder->SetInsertPoint(entryBasicBlock);
 
 	// Àëëîêàöèè ïåðåìåííûõ
-	auto* vsp = llvmIrBuilder->CreateAlloca(i8, llvmIrBuilder->getInt32(4096), "vsp_array");
+	auto* vsp = llvmIrBuilder->CreateAlloca(i8, llvmIrBuilder->getInt32(defaultStackSize), "vsp_array");
 
 	auto* vsp_ptr = llvmIrBuilder->CreateConstInBoundsGEP1_32(
 		i8,
 		vsp,
-		2048, // <--- ÂÎÒ ÎÍÎ, ÌÀÃÈ×ÅÑÊÎÅ ×ÈÑËÎ
+		defaultStackSize / 2, // <--- ÂÎÒ ÎÍÎ, ÌÀÃÈ×ÅÑÊÎÅ ×ÈÑËÎ
 		"vsp_base_middle"
 	);
 
@@ -100,6 +103,7 @@ void LLVMTraceLifter::LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector
 	constr.imageBaseDif = imageBaseDif;
 	constr.targetVip = targetVip;
 	constr.realStackPtr = realStackPtr;
+	constr.aslrDifference = aslrDifference;
 
 
 	// --- Init Lifter ---

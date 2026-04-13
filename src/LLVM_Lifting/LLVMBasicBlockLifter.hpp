@@ -22,6 +22,8 @@ struct BasicBlockLifterConstructor {
 
 	llvm::Value* imageBaseDif;
 	llvm::Value* targetVip;
+
+	uint64_t aslrDifference{ 0 };
 };
 
 struct StackAddressMeta {
@@ -50,6 +52,7 @@ class LLVMBasicBlockLifter {
 	llvm::Value* imageBaseDif;
 	llvm::Value* targetVip;
 	llvm::Value* realStackPtr;
+	uint64_t aslrDifference{ 0 };
 
 private:
 	llvm::Type* i64;
@@ -227,6 +230,8 @@ private:
 	void LiftVmShld(bool logDebugMessage, const HandlerMatch& match);
 	void LiftVmShrd(bool logDebugMessage, const HandlerMatch& match);
 #pragma endregion
+
+	void LiftRdtsc(bool logDebugMessage);
 
 	void LiftVmJmpIndirect(bool logDebugMessage, const VmJmpData& jmpData);
 	void LiftVmExit(bool logDebugMessage, const VmExitData& data);

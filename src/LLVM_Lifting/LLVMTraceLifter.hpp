@@ -33,10 +33,11 @@ private:
 	llvm::Value* imageBaseDif;
 	llvm::Value* realStackPtr;
 	llvm::AllocaInst* targetVip;
-	friend class CFGRepatcher;
-
+	uint32_t defaultStackSize = 0x1000;
+	uint64_t aslrDifference{ 0 };
 public:
-	LLVMTraceLifter(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock);
+	LLVMTraceLifter(uint32_t overrideStackSize = 0, uint64_t aslrDifference = 0);
+	void LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock);
 	void OptimizeModule(bool enableO3Optimization);
 	void PrintModule() {
 		llvm::outs() << "\n[LLVM IR DUMP START]\n";
@@ -56,5 +57,5 @@ public:
 private:
 	void CreateNativeContextType();
 	void CreateFunction(const char* functionName);
-	void LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock);
+	
 };

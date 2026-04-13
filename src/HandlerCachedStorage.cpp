@@ -59,6 +59,7 @@ std::optional<HandlerMatch> HandlerCachedStorage::TryGetCachedInstruction(
 	else if (cachedData.type == Handler_VmPopVsp) {
 		VmPopVspData data;
 		match.matchData = data;
+		__debugbreak();
 	}
 	else if (cachedData.type == Handler_VmAdd ||
 		cachedData.type == Handler_VmNor ||
@@ -105,7 +106,8 @@ std::optional<HandlerMatch> HandlerCachedStorage::TryGetCachedInstruction(
 		match.matchData = data;
 
 	}
-	else if (cachedData.type == Handler_VmDispatch) {
+	else if (cachedData.type == Handler_VmDispatch ||
+		cachedData.type == Handler_VmRdtsc) {
 
 	}
 	else {
