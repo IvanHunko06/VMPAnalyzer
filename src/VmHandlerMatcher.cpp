@@ -912,16 +912,32 @@ std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationDat
 		jmpData.newVspReg = vspCandidats[0];
 	}
 	else {
-		for (auto& candidat : vspCandidats) {
+		// Используем индекс вместо итератора
+		for (size_t i = 0; i < vspCandidats.size(); ++i)
+		{
+			auto candidat = vspCandidats[i];
+
 			if (candidat == data.vspRegId) continue;
+
 			auto it = std::ranges::find_if(trace.instructions, [candidat](const NativeInstructionContext& instr) {
 				auto& tritonInstr = instr.instruction;
 				if (tritonInstr->getType() != triton::arch::x86::ID_INS_MOV) return false;
+
 				auto& operand2 = tritonInstr->operands[1];
 				if (operand2.getType() != triton::arch::OP_REG) return false;
+
 				return operand2.getRegister().getId() == candidat;
 				});
-			if (it != trace.instructions.end()) continue;
+
+			if (it != trace.instructions.end()) {
+				auto newCandidat = it->instruction->operands[0].getRegister().getParent();
+				auto findIt = std::ranges::find(vipCandidats, newCandidat);
+				if (findIt == vipCandidats.end()) {
+					vspCandidats.push_back(it->instruction->operands[0].getRegister().getParent());
+					continue;
+				}
+			}
+
 			jmpData.newVspReg = candidat;
 			break;
 		}
@@ -936,6 +952,11 @@ std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationDat
 			jmpData.newVipReg = candidat;
 			break;
 		}
+	}
+
+	if (jmpData.newVipReg == triton::arch::register_e::ID_REG_INVALID ||
+		jmpData.newVspReg == triton::arch::register_e::ID_REG_INVALID) {
+		return std::nullopt;
 	}
 
 	auto readIt = data.logicReads.find(data.vspChange.startValue);
@@ -965,6 +986,33 @@ std::optional<HandlerMatch> TryMatchVmJmpIndirectRemap(const HandlerEmulationDat
 	match.matchData = jmpData;
 
 	return match;
+}
+
+std::optional<HandlerMatch> TryMatchVmRdtsc(const HandlerEmulationData& data, const VmHandlerTrace& trace) {
+	if (!data.vipAst || !data.vspAst) return std::nullopt;
+
+	auto vspDeltaOpt = GetAddImmediate(data.vspAst.value(), "VSP");
+	auto vipDeltaOpt = GetAddImmediate(data.vipAst.value(), "VIP");
+
+	if (!vspDeltaOpt || !vipDeltaOpt) return std::nullopt;
+
+	if (std::abs(*vipDeltaOpt) > 4) return std::nullopt;
+	if (*vspDeltaOpt != -8) return std::nullopt;
+
+	for (const auto& istr : trace.instructions) {
+		if (istr.instruction->getType() == triton::arch::x86::ID_INS_RDTSC) {
+			HandlerMatch match;
+			match.type = Handler_VmRdtsc;
+			match.bitDepth = BitDepth_64;
+			match.addr = data.baseAddress;
+			match.vipBefore = data.vipChange.startValue;
+			match.vspBefore = data.vspChange.startValue;
+			match.vspAfter = data.vspChange.endValue;
+			return match;
+		}
+	}
+
+	return std::nullopt;
 }
 
 std::optional<HandlerMatch> TryMatchVmExit(const HandlerEmulationData& data) {
@@ -1070,6 +1118,9 @@ HandlerMatch MatchVmHandler(const HandlerEmulationData& data, const VmHandlerTra
 	auto isVmDispatch = TryMatchVmDispatch(data);
 	if (isVmDispatch) return *isVmDispatch;
 
+	auto isVmRdtsc = TryMatchVmRdtsc(data, trace);
+	if (isVmRdtsc) return *isVmRdtsc;
+
 	auto isVmExit = TryMatchVmExit(data);
 	if (isVmExit) return *isVmExit;
 
@@ -1147,7 +1198,8 @@ std::ostream& operator<<(std::ostream& os, const HandlerMatch& p) {
 			<< matchData.value << std::dec;
 	}
 	else if (p.type == VmHandlerType::Handler_VmPopVsp) {
-		os << "VM_POP_VSP";
+		auto& matchData = std::get<VmPopVspData>(p.matchData);
+		os << "VM_POP_VSP" << "\t\t\tDelta: " << matchData.offset;
 	}
 	else if (p.type == VmHandlerType::Handler_VmReadMem) {
 		auto matchData = std::get<VmMemAccessData>(p.matchData);
@@ -1264,6 +1316,9 @@ std::ostream& operator<<(std::ostream& os, const HandlerMatch& p) {
 			std::cout << reg.name << ' ';
 		}
 		std::cout << "}";
+	}
+	else if (p.type == VmHandlerType::Handler_VmRdtsc) {
+		std::cout << "VM_RDTSC";
 	}
 
 	return os;
