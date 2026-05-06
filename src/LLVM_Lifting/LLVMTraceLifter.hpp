@@ -30,13 +30,18 @@ private:
 private:
 	llvm::StructType* nativeContextType;
 	llvm::Value* nativeContextPtr;
-	llvm::Value* imageBaseDif;
+	llvm::Value* imageBaseDif{ nullptr };
 	llvm::Value* realStackPtr;
 	llvm::AllocaInst* targetVip;
 	uint32_t defaultStackSize = 0x1000;
 	uint64_t aslrDifference{ 0 };
+	bool aslrAsArg{ false };
+
 public:
 	LLVMTraceLifter(uint32_t overrideStackSize = 0, uint64_t aslrDifference = 0);
+	void SetAslrAsArg(bool aslrAsArg) {
+		this->aslrAsArg = aslrAsArg;
+	}
 	void LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock);
 	void OptimizeModule(bool enableO3Optimization);
 	void PrintModule() {

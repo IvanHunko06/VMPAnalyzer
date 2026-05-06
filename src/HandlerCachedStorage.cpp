@@ -110,6 +110,10 @@ std::optional<HandlerMatch> HandlerCachedStorage::TryGetCachedInstruction(
 		cachedData.type == Handler_VmRdtsc) {
 
 	}
+	else if (cachedData.type == Handler_VmImul ||
+		cachedData.type == Handler_VmMul) {
+
+	}
 	else {
 		__debugbreak();
 	}

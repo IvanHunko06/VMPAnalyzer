@@ -24,6 +24,7 @@ struct BasicBlockLifterConstructor {
 	llvm::Value* targetVip;
 
 	uint64_t aslrDifference{ 0 };
+	llvm::Value* aslrAsArg{ nullptr };
 };
 
 struct StackAddressMeta {
@@ -31,11 +32,27 @@ struct StackAddressMeta {
 	int32_t slotAbsoluteBase{ 0 };
 	int32_t relativeOffset{ 0 };
 };
+struct FlagsPromise {
+	llvm::Value* op1{ nullptr };
+	llvm::Value* op2{ nullptr };
+	llvm::Value* op3{ nullptr };
+	llvm::Value* res{ nullptr };
+	llvm::Type* opType{ nullptr };
+	enum OperationType {
+		ADD, NOR, NAND, SHL, SHR, SHLD, SHRD, IMUL, MUL
+	} operation;
+};
+struct StackMetadata {
+	//bool isPadding{ false };
+	int32_t bitDepth{ 64 };
+	StackAddressMeta addressMeta;
+	std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
+	std::optional<int64_t> constantValue; // Если известно, что в этом слоте всегда будет константа, сохраняем её значение для оптимизаций
+};
 
 struct BasicBlockLifterState {
-	std::map<int32_t, StackAddressMeta> addressMetasStorage;
-	int64_t virtualStackOffset = 0;
-	int64_t realStackOffset{ 0 };
+	int64_t stackOffset{ 0 };
+	std::map<int32_t, StackMetadata> virtualStackMetas;
 };
 
 class LLVMBasicBlockLifter {
@@ -53,6 +70,7 @@ class LLVMBasicBlockLifter {
 	llvm::Value* targetVip;
 	llvm::Value* realStackPtr;
 	uint64_t aslrDifference{ 0 };
+	llvm::Value* aslrAsArg{ nullptr };
 
 private:
 	llvm::Type* i64;
@@ -62,50 +80,39 @@ private:
 	llvm::Type* voidTy;
 	llvm::PointerType* ptrTy;
 private:
-	struct FlagsPromise {
-		llvm::Value* op1{ nullptr };
-		llvm::Value* op2{ nullptr };
-		llvm::Value* op3{ nullptr };
-		llvm::Value* res{ nullptr };
-		llvm::Type* opType{ nullptr };
-		enum OperationType {
-			ADD, NOR, NAND, SHL, SHR, SHLD, SHRD
-		} operation;
-	};
-	struct StackMetadata {
-		bool isPadding{ false };
-		StackAddressMeta addressMeta;
-		std::optional<FlagsPromise> flagsPromise; // Если этот слот связан с операцией, которая обещает флаги, сохраняем эту информацию здесь
-	};
-	using ShadowStackType = ShadowStack<StackMetadata>;
-	ShadowStackType shadowStack;
+	//using ShadowStackType = ShadowStack<StackMetadata>;
+	//ShadowStackType shadowStack;
 	static constexpr uint64_t fakeStackBase = 0x140000;
-
+	struct PopResult {
+		llvm::Value* value;
+		int64_t stackOffset;
+		StackMetadata metadata;
+	};
 
 private:
-	std::map<int32_t, StackAddressMeta> addressInRegMetas;
-	std::map<int32_t, FlagsPromise> calculateFlagsPromises; // Если регистр, который обещает флаги, был перезаписан, сохраняем информацию о том, какие флаги он обещал, чтобы можно было попытаться восстановить эти флаги при необходимости
-	std::map<int32_t, StackAddressMeta> addressMetasStorage;
-
-	int64_t virtualStackOffset = 0;
-	int64_t realStackOffset{ 0 };
+	//std::map<int32_t, StackAddressMeta> addressInRegMetas;
+	//std::map<int32_t, FlagsPromise> calculateFlagsPromises; // Если регистр, который обещает флаги, был перезаписан, сохраняем информацию о том, какие флаги он обещал, чтобы можно было попытаться восстановить эти флаги при необходимости
+	//std::map<int32_t, StackAddressMeta> addressMetasStorage;
+	std::map<int32_t, StackMetadata> virtualRegisterMetas; // Метаданные для виртуальных регистров (которые используются в IR и не обязательно соответствуют реальным регистрам)
+	std::map<int32_t, StackMetadata> virtualStackMetas;    // Метаданные для виртуальных адресов в стеке (которые используются в IR и не обязательно соответствуют реальным адресам в стеке)
+	int64_t stackOffset = 0;
+	uint64_t currentBlockVip = 0;
 
 public:
 	LLVMBasicBlockLifter(const BasicBlockLifterConstructor& ctor);
 	
 	llvm::BasicBlock* LiftBasicBlock(const VirtualBasicBlock& vbb, bool useMemoryHooks = true, bool logMessages = false);
-	void FlushVsp(bool clearStack, bool writeToRealStack);
+	//void FlushVsp(bool clearStack, bool writeToRealStack);
+	void FlushToRealStack();
 	BasicBlockLifterState SaveState() {
 		BasicBlockLifterState state;
-		state.addressMetasStorage = addressMetasStorage;
-		state.realStackOffset = realStackOffset;
-		state.virtualStackOffset = virtualStackOffset;
+		state.stackOffset = stackOffset;
+		state.virtualStackMetas = virtualStackMetas;
 		return state;
 	}
 	void ApplyState(const BasicBlockLifterState& state) {
-		addressMetasStorage = state.addressMetasStorage;
-		realStackOffset = state.realStackOffset;
-		virtualStackOffset = state.virtualStackOffset;
+		stackOffset = state.stackOffset;
+		virtualStackMetas = state.virtualStackMetas;
 	}
 
 private:
@@ -158,20 +165,44 @@ private:
 	}
 
 #pragma region Shadow Stack Operations
-	void PushWithConstOffset(llvm::Value* value, HandlerBitDepth bitDepth, bool actuallyWriteToRealStack);
-	void Push(llvm::Value* value, HandlerBitDepth bitDepth) {
-		StackMetadata meta;
-		shadowStack.Push(bitDepth, value, meta);
+	//void PushWithConstOffset(llvm::Value* value, HandlerBitDepth bitDepth, bool actuallyWriteToRealStack);
+	void Push(llvm::Value* value, HandlerBitDepth bitDepth, StackMetadata meta = {}) {
+		stackOffset -= bitDepth / 8;
+		meta.bitDepth = bitDepth; // Сохраняем ширину!
+		virtualStackMetas[stackOffset] = std::move(meta);
+
+		if (value) {
+			llvm::Value* ptr = builder->CreateConstInBoundsGEP1_64(i8, vspPtr, stackOffset);
+			llvm::Value* typedPtr = builder->CreateBitCast(ptr, GetTypeByDepth(bitDepth)->getPointerTo());
+			builder->CreateStore(value, typedPtr);
+		}
 	}
 	
-	llvm::Value* PopWithConstOffset(HandlerBitDepth bitDepth);
-	ShadowStackType::PopType Pop(HandlerBitDepth bitDepth) {
-		auto result = shadowStack.Pop(bitDepth);
-		auto addrMeta = addressMetasStorage.find(virtualStackOffset - bitDepth);
-		if (addrMeta != addressMetasStorage.end()) {
-			result.metadata.addressMeta = addrMeta->second;
-			addressMetasStorage.erase(addrMeta);
-		}
+	//llvm::Value* PopWithConstOffset(HandlerBitDepth bitDepth);
+	PopResult Pop(HandlerBitDepth bitDepth, bool eraseMeta = true) {
+		auto meta = virtualStackMetas[stackOffset];
+		if (eraseMeta) virtualStackMetas.erase(stackOffset);
+
+		llvm::Value* ptr = builder->CreateConstInBoundsGEP1_64(
+			i8,
+			vspPtr,
+			stackOffset
+		);
+
+		llvm::Value* typedPtr = builder->CreateBitCast(
+			ptr,
+			GetTypeByDepth(bitDepth)->getPointerTo()
+		);
+
+		llvm::Value* val = builder->CreateLoad(GetTypeByDepth(bitDepth), typedPtr);
+
+		PopResult result;
+		result.metadata = std::move(meta);
+		result.value = val;
+		result.stackOffset = stackOffset;
+
+		stackOffset += bitDepth / 8;
+
 		return result;
 	}
 #pragma endregion
@@ -232,6 +263,7 @@ private:
 #pragma endregion
 
 	void LiftRdtsc(bool logDebugMessage);
+	void LiftMul(bool logDebugMessage, const HandlerMatch& match);
 
 	void LiftVmJmpIndirect(bool logDebugMessage, const VmJmpData& jmpData);
 	void LiftVmExit(bool logDebugMessage, const VmExitData& data);

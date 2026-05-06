@@ -18,6 +18,7 @@ void PrintHelp() {
 	std::cout << "-no_optimize						 - don`t optimize lifted IR\n";
 	std::cout << "-llvm_override_stack_size <size>   - override llvm default stack size (4096) with custom value. Can be useful for handlers with big stack frames\n";
 	std::cout << "-llvm_override_aslr_dif   <diff>   - ASLR difference between image base during trace recording and current image base. Can be useful for correct resolving of some handlers (like VmJmpIndirect). Required for llvm lifting\n";
+	std::cout << "-aslr_as_arg						 - treat ASLR diff as additional arguments for llvm functions.\n";
 }
 std::string ReadString(char** args, int argsCount, int* curArgIndex, const char* argName) {
 	const char* curArg = args[*curArgIndex];
@@ -48,10 +49,10 @@ int main(int argc, char* argv[]) {
 	std::vector<std::string> inputFiles;
 	std::string outputFile = "vm_lifted_module.ll";
 	uint32_t overrideStackSize = 0;
-	std::atomic<uint64_t> imageBaseAslrDiff = 0;
 	bool useCaching = false;
 	bool printBasicBlocks = false;
 	bool optimize = true;
+	bool aslrAsArg = false;
 
 	for (int i = 1; i < argc; ) {
 		auto inputPath = ReadString(argv, argc, &i, "-input");
@@ -72,6 +73,11 @@ int main(int argc, char* argv[]) {
 
 		if (ReadFlag(argv, argc, &i, "-print_blocks")) {
 			printBasicBlocks = true;
+			continue;
+		}
+
+		if (ReadFlag(argv, argc, &i, "-aslr_as_arg")) {
+			aslrAsArg = true;
 			continue;
 		}
 
@@ -105,6 +111,11 @@ int main(int argc, char* argv[]) {
 	std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> blockTransitions;
 	std::mutex mutex;
 	std::mutex printErrorMutex;
+	std::set<uint64_t> breakpoints{
+		//0x15620eabc
+		//0x15614daec
+		//0x1561422f2
+	};
 
 	std::for_each(std::execution::par, inputFiles.begin(), inputFiles.end(), [&](const std::string& inputFile) {
 		std::fstream file(inputFile, std::ios::in);
@@ -112,6 +123,7 @@ int main(int argc, char* argv[]) {
 
 		triton::arch::register_e vipReg = triton::arch::ID_REG_INVALID;
 		triton::arch::register_e vspReg = triton::arch::ID_REG_INVALID;
+		uint64_t imageBaseAslrDiff = 0;
 
 		std::vector<HandlerMatch> vmHandlers;
 		for (auto& trace : handlerTraces) {
@@ -120,6 +132,13 @@ int main(int argc, char* argv[]) {
 			auto cachedHandler = cacheStorage.TryGetCachedInstruction(addr, trace, vipReg, vspReg);
 			if (!cachedHandler) {
 				auto data = EmulateVmHandler(trace, vipReg, vspReg);
+				if (breakpoints.contains(addr)) {
+					__debugbreak();
+					std::lock_guard<std::mutex> lock(printErrorMutex);
+					PrintBasicBlock(trace);
+					std::cout << '\n';
+					PrintEmulationData(data);
+				}
 
 				currentHandler = MatchVmHandler(data, trace);
 				if (currentHandler.type == Handler_Unknown) {
@@ -156,7 +175,7 @@ int main(int argc, char* argv[]) {
 				auto matchData = std::get<VmEntryHandlerData>(currentHandler.matchData);
 				vipReg = matchData.vipReg;
 				vspReg = matchData.vspReg;
-				imageBaseAslrDiff.store(matchData.imageBaseDifference, std::memory_order_relaxed);
+				imageBaseAslrDiff = matchData.imageBaseDifference;
 			}
 
 			if (currentHandler.type == VmHandlerType::Handler_VmJmpIndirect) {
@@ -176,6 +195,7 @@ int main(int argc, char* argv[]) {
 		
 		VirtualBasicBlock* prevGlobalBlock = nullptr;
 		for (auto& localBlock : virtualBlocks) {
+			localBlock.startAddr -= imageBaseAslrDiff;
 			VirtualBasicBlock* currentGlobalBlock = nullptr;
 
 			// 1. »щем, существует ли уже этот блок в глобальном графе
@@ -228,8 +248,9 @@ int main(int argc, char* argv[]) {
 	
 
 
-	
-	LLVMTraceLifter lifter(overrideStackSize, imageBaseAslrDiff.load(std::memory_order_relaxed));
+	//imageBaseAslrDiff.store(0, std::memory_order_relaxed);
+	LLVMTraceLifter lifter(overrideStackSize, 0);
+	lifter.SetAslrAsArg(aslrAsArg);
 	lifter.LiftTraceFunction(blockTransitions, &uniqueBasicBlocks.front());
 	if (optimize) lifter.OptimizeModule(true);
 	lifter.PrintModule();

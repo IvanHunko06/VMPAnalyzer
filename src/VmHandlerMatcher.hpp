@@ -22,7 +22,10 @@ enum VmHandlerType {
 	Handler_VmShr,    // (>>)
 	Handler_VmShl,    // (<<)
 	Handler_VmRol,    // Rotate Left
-	Handler_VmRor,    // Rotate Right
+	Handler_VmRor,    // Rotate Right,
+	Handler_VmImul,   // Integer multiplication
+	Handler_VmMul,    // Unsigned multiplication
+	//Handler_VmIDIV,   // Integer division
 
 	Handler_VmShld,
 	Handler_VmShrd,

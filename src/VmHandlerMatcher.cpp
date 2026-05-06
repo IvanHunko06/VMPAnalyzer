@@ -477,8 +477,14 @@ std::optional<HandlerMatch> TryMatchVmPopVsp(const HandlerEmulationData& data) {
 	if (data.logicReads.size() > 8) return std::nullopt;
 
 	int64_t vspDelta = data.vspChange.endValue - data.vspChange.startValue;
-	if (hasWrites && vspDelta > 0) return std::nullopt;
-	if (!hasWrites && vspDelta < 0) return std::nullopt;
+	int64_t rspDelta = data.rspChange.endValue - data.rspChange.startValue;
+
+	if (rspDelta) {
+		if (hasWrites && vspDelta > 0) return std::nullopt;
+		if (!hasWrites && vspDelta < 0) return std::nullopt;
+	}
+
+	
 
 	HandlerMatch match;
 	match.type = Handler_VmPopVsp;
@@ -631,8 +637,23 @@ VmHandlerType DetectAluOperation(const triton::ast::SharedAbstractNode& node) {
 	// 1. Прямые операции
 	if (type == triton::ast::BVADD_NODE) return Handler_VmAdd;
 	if (type == triton::ast::BVSUB_NODE) return Handler_VmAdd; // SUB это ADD с отрицанием, но можно выделить отдельно
-	if (type == triton::ast::BVLSHR_NODE) return Handler_VmShr;
-	if (type == triton::ast::BVSHL_NODE) return Handler_VmShl;
+	if (type == triton::ast::BVSHL_NODE || type == triton::ast::BVLSHR_NODE) {
+		bool hasVariable = true;
+		for (const auto& child : node->getChildren()) {
+			if (child->getType() != triton::ast::VARIABLE_NODE &&
+				child->getType() != triton::ast::ZX_NODE &&
+				child->getType() != triton::ast::BVOR_NODE &&
+				child->getType() != triton::ast::BVAND_NODE &&
+				child->getType() != triton::ast::BV_NODE) {
+				hasVariable = false;
+				break;
+			}
+		}
+		if (hasVariable) {
+			if (type == triton::ast::BVLSHR_NODE) return Handler_VmShr;
+			if (type == triton::ast::BVSHL_NODE) return Handler_VmShl;
+		}
+	}
 	if (type == triton::ast::BVROL_NODE) return Handler_VmRol;
 	if (type == triton::ast::BVROR_NODE) return Handler_VmRor;
 
@@ -677,6 +698,13 @@ std::optional<HandlerMatch> TryMatchGenericVmAlu(const HandlerEmulationData& dat
 
 		// Пытаемся определить операцию по AST
 		auto type = DetectAluOperation(writeInfo.ast);
+		if (type != Handler_Unknown) {
+			auto instrType = writeInfo.instruction->instruction->getType();
+			if (instrType == triton::arch::x86::ID_INS_SHLD ||
+				instrType == triton::arch::x86::ID_INS_SHRD) {
+				continue; // Эти операции обрабатываются отдельно в TryMatchVmDoubleShift
+			}
+		}
 		if (type != Handler_Unknown) {
 			// Проверяем зависимость от стека
 			if (DependsOnStack(writeInfo.ast)) {
@@ -754,8 +782,43 @@ std::optional<HandlerMatch> TryMatchVmDoubleShift(const HandlerEmulationData& da
 	const MemoryAccessInfo* resultWrite = nullptr;
 	VmHandlerType detectedType = Handler_Unknown;
 
+	int stackVariableCount = 0;
+	for (const auto& [addr, readInfo] : data.logicReads) {
+		auto ast = readInfo.ast;
+		auto variable = GetVariableName(ast);
+		if (variable && variable->starts_with("StackArg_")) {
+			stackVariableCount++;
+		}
+	}
+
+	if (stackVariableCount != 3) {
+		return std::nullopt; // Обычно 3 аргумента: Dest, Src, Shift
+	}
+
 	// 1. Ищем запись результата (OR двух сдвигов)
 	for (const auto& [addr, writeInfo] : data.logicWrites) {
+		auto ast = writeInfo.ast;
+		// Снимаем "шелуху" с верхнего уровня (EXTRACT, ZX, SX)
+		while (true) {
+			auto type = ast->getType();
+			auto children = ast->getChildren();
+
+			if (type == triton::ast::EXTRACT_NODE && children.size() >= 3) {
+				// В EXTRACT дети: [0] = high, [1] = low, [2] = expr
+				ast = children[2];
+			}
+			else if ((type == triton::ast::ZX_NODE || type == triton::ast::SX_NODE) && children.size() >= 2) {
+				// В ZX/SX дети: [0] = extend_size, [1] = expr
+				ast = children[1];
+			}
+			else {
+				// Если это не EXTRACT/ZX/SX или структура нестандартная — прерываем цикл
+				break;
+			}
+		}
+
+		if (ast->getType() == triton::ast::VARIABLE_NODE) continue; // Пропускаем простые переменные, это могут быть флаги или результат других операций
+
 		if (writeInfo.ast->getType() == triton::ast::BVOR_NODE) {
 			auto children = writeInfo.ast->getChildren();
 			if (children.size() != 2) continue;
@@ -787,6 +850,27 @@ std::optional<HandlerMatch> TryMatchVmDoubleShift(const HandlerEmulationData& da
 
 				resultWrite = &writeInfo;
 				break;
+			}
+		}
+
+		if (ast->getType() == triton::ast::BVLSHR_NODE || ast->getType() == triton::ast::BVSHL_NODE) {
+			auto targetChild = ast->getChildren()[0];
+			if (targetChild->getType() == triton::ast::BVOR_NODE) {
+				bool hasInnerShift = false;
+				for (const auto& orChild : targetChild->getChildren()) {
+					if (orChild->getType() == triton::ast::BVSHL_NODE ||
+						orChild->getType() == triton::ast::BVLSHR_NODE) {
+						hasInnerShift = true;
+						break;
+					}
+				}
+
+				if (hasInnerShift) {
+					// Внешний сдвиг определяет тип инструкции (LSHR = SHRD, SHL = SHLD)
+					detectedType = (ast->getType() == triton::ast::BVLSHR_NODE) ? Handler_VmShrd : Handler_VmShld;
+					resultWrite = &writeInfo;
+					break;
+				}
 			}
 		}
 	}
@@ -1049,7 +1133,7 @@ std::optional<HandlerMatch> TryMatchVmExit(const HandlerEmulationData& data) {
 			++actualPopCount;
 			NativeRegData pushedRegData;
 			pushedRegData.id = data.context->registers.x86_eflags.getId();
-			pushedRegData.name = data.context->registers.x86_eflags.getName();
+			pushedRegData.name = "rflags";
 			pushedRegData.value = readInfo.concreteValue;
 			exitData.popedRegsOrder.push_back(pushedRegData);
 		}
@@ -1080,6 +1164,68 @@ std::optional<HandlerMatch> TryMatchVmDispatch(const HandlerEmulationData& data)
 	return match;
 }
 
+std::optional<HandlerMatch> TryMatchVmMul(const HandlerEmulationData& data, const VmHandlerTrace& trace) {
+	if (!data.vipAst || !data.vspAst) return std::nullopt;
+
+	auto vspDeltaOpt = GetAddImmediate(data.vspAst.value(), "VSP");
+	auto vipDeltaOpt = GetAddImmediate(data.vipAst.value(), "VIP");
+
+	if (!vspDeltaOpt || !vipDeltaOpt) return std::nullopt;
+
+	if (std::abs(*vipDeltaOpt) > 4) return std::nullopt;
+	if (*vspDeltaOpt < -16 || *vspDeltaOpt > -6) return std::nullopt;
+
+	const NativeInstructionContext* mulInstr = nullptr;
+	for (auto& instr : trace.instructions) {
+		if (instr.instruction->getType() == triton::arch::x86::ID_INS_MUL ||
+			instr.instruction->getType() == triton::arch::x86::ID_INS_IMUL) {
+			mulInstr = &instr;
+			break;
+		}
+	}
+
+	if (mulInstr == nullptr) return std::nullopt;
+
+	if (mulInstr->instruction->operands.size() != 1) return std::nullopt; // Временная эвристика для простых IMUL с одним операндом
+	auto& operand = mulInstr->instruction->operands[0];
+	if (operand.getType() != triton::arch::OP_REG) return std::nullopt;
+
+	HandlerMatch match;
+	match.type = mulInstr->instruction->getType() == triton::arch::x86::ID_INS_MUL ? Handler_VmMul : Handler_VmImul;
+	match.bitDepth = (HandlerBitDepth)(operand.getRegister().getSize() * 8);
+	match.addr = data.baseAddress;
+	match.vipBefore = data.vipChange.startValue;
+	match.vspBefore = data.vspChange.startValue;
+	match.vspAfter = data.vspChange.endValue;
+
+	bool hasMulAst = false;
+	for (auto& [addr, writeInfo] : data.logicWrites) {
+		if (writeInfo.size != operand.getRegister().getSize()) continue;
+		if (writeInfo.ast->getType() == triton::ast::BVMUL_NODE) {
+			auto& ast = writeInfo.ast;
+			auto& children = ast->getChildren();
+			if (children.size() != 2) continue;
+
+			auto& child1 = children[0];
+			auto& child2 = children[1];
+			auto name1 = GetVariableName(child1);
+			auto name2 = GetVariableName(child2);
+			if (!name1 || !name2) continue;
+
+			if (!name1->starts_with("StackArg_") || 
+				!name2->starts_with("StackArg_")) continue;
+
+			if (name1 == name2) continue;
+
+			hasMulAst = true;
+		}
+	}
+
+	if (!hasMulAst) return std::nullopt;
+
+	return match;
+}
+
 HandlerMatch MatchVmHandler(const HandlerEmulationData& data, const VmHandlerTrace& trace) {
 
 	auto isVmEntryHandler = TryMatchVmEntry(data);
@@ -1106,11 +1252,11 @@ HandlerMatch MatchVmHandler(const HandlerEmulationData& data, const VmHandlerTra
 	auto isVmWriteMem = TryMatchVmWriteMem(data);
 	if (isVmWriteMem) return *isVmWriteMem;
 
-	auto isVmAlu = TryMatchGenericVmAlu(data);
-	if (isVmAlu) return *isVmAlu;
-
 	auto isVmDoubleShft = TryMatchVmDoubleShift(data);
 	if (isVmDoubleShft) return *isVmDoubleShft;
+
+	auto isVmAlu = TryMatchGenericVmAlu(data);
+	if (isVmAlu) return *isVmAlu;
 
 	auto isVmJmpIndirectRemap = TryMatchVmJmpIndirectRemap(data, trace);
 	if (isVmJmpIndirectRemap) return *isVmJmpIndirectRemap;
@@ -1120,6 +1266,9 @@ HandlerMatch MatchVmHandler(const HandlerEmulationData& data, const VmHandlerTra
 
 	auto isVmRdtsc = TryMatchVmRdtsc(data, trace);
 	if (isVmRdtsc) return *isVmRdtsc;
+
+	auto isVmMul = TryMatchVmMul(data, trace);
+	if (isVmMul) return *isVmMul;
 
 	auto isVmExit = TryMatchVmExit(data);
 	if (isVmExit) return *isVmExit;
@@ -1319,6 +1468,12 @@ std::ostream& operator<<(std::ostream& os, const HandlerMatch& p) {
 	}
 	else if (p.type == VmHandlerType::Handler_VmRdtsc) {
 		std::cout << "VM_RDTSC";
+	}
+	else if (p.type == VmHandlerType::Handler_VmMul) {
+		std::cout << "VM_MUL" << p.bitDepth;
+	}
+	else if (p.type == VmHandlerType::Handler_VmImul) {
+		std::cout << "VM_IMUL" << p.bitDepth;
 	}
 
 	return os;

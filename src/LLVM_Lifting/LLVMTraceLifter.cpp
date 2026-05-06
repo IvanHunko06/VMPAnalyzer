@@ -34,7 +34,6 @@ LLVMTraceLifter::LLVMTraceLifter(uint32_t overrideStackSize, uint64_t aslrDiffer
 	}
 
 	CreateNativeContextType();
-	CreateFunction("ProtectedTrace");
 }
 
 void LLVMTraceLifter::CreateNativeContextType() {
@@ -49,7 +48,11 @@ void LLVMTraceLifter::CreateNativeContextType() {
 void LLVMTraceLifter::CreateFunction(const char* functionName) {
 	using namespace llvm;
 
-	auto* funcType = FunctionType::get(voidTy, {nativeContextType->getPointerTo(), i8->getPointerTo(), i64}, false);
+	std::vector<llvm::Type*> paramTypes{ nativeContextType->getPointerTo(), i8->getPointerTo() };
+	if (aslrAsArg) {
+		paramTypes.push_back(i64);
+	}
+	auto* funcType = FunctionType::get(voidTy, paramTypes, false);
 	function = Function::Create(funcType, llvm::Function::ExternalLinkage, functionName, *llvmModule);
 
 	auto argsIt = function->arg_begin();
@@ -59,12 +62,16 @@ void LLVMTraceLifter::CreateFunction(const char* functionName) {
 	realStackPtr = argsIt++;
 	realStackPtr->setName("real_stack_ptr");
 
-	imageBaseDif = argsIt++;
-	imageBaseDif->setName("image_base_dif");
+	if (aslrAsArg) {
+		imageBaseDif = argsIt++;
+		imageBaseDif->setName("image_base_dif");
+	}
 }
 
 void LLVMTraceLifter::LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector<VirtualBasicBlock*>> transitions, VirtualBasicBlock* startBasicBlock) {
 	using namespace llvm;
+
+	CreateFunction("ProtectedTrace");
 
 	auto* entryBasicBlock = BasicBlock::Create(*llvmContext, "entry", function);
 
@@ -104,6 +111,7 @@ void LLVMTraceLifter::LiftTraceFunction(std::map<VirtualBasicBlock*, std::vector
 	constr.targetVip = targetVip;
 	constr.realStackPtr = realStackPtr;
 	constr.aslrDifference = aslrDifference;
+	constr.aslrAsArg = imageBaseDif;
 
 
 	// --- Init Lifter ---
